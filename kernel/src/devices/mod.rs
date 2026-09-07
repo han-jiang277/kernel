@@ -35,6 +35,8 @@ pub mod console;
 mod error;
 pub mod framebuffer;
 pub mod gpio;
+#[cfg(i2s)]
+pub mod i2s;
 pub mod i2c_core;
 #[cfg(enable_net)]
 pub(crate) mod net;

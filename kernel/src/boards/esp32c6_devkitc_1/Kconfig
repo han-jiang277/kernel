@@ -44,6 +44,36 @@ config MAX7219
     select USE_EMBEDDED_HAL_V1
     help
       Enable the MAX7219 LED matrix controller.
+config I2S
+    bool "Enable I2S driver"
+    default n
+    help
+      Enable the ESP32-C6 I2S0 register-level driver with GDMA support.
+      Required for audio playback/capture on boards with I2S codecs
+      (e.g. ES8311 on the Waveshare ESP32-C6 Touch AMOLED 2.16).
+
+if I2S
+config I2S_MCLK_GPIO
+    int "I2S MCLK GPIO"
+    default 19
+    range 0 30
+config I2S_BCLK_GPIO
+    int "I2S BCLK GPIO"
+    default 20
+    range 0 30
+config I2S_WS_GPIO
+    int "I2S WS (LRCK) GPIO"
+    default 22
+    range 0 30
+config I2S_DOUT_GPIO
+    int "I2S DOUT (TX data) GPIO"
+    default 23
+    range 0 30
+config I2S_DIN_GPIO
+    int "I2S DIN (RX data) GPIO"
+    default 21
+    range 0 30
+endif
 
 config CST9220
     bool "Enable CST9220 touch controller"

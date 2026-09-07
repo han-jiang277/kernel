@@ -542,6 +542,8 @@ crate::define_peripheral! {
      blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(0)),
     (led_r, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
      blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(1)),
+    (i2s0, blueos_driver::i2s::esp32c6_i2s::Esp32c6I2s0<0, 1>,
+     blueos_driver::i2s::esp32c6_i2s::Esp32c6I2s0::<0, 1>::new()),
 }
 
 crate::define_bus! {
@@ -604,7 +606,7 @@ crate::define_bus! {
     ),
 }
 
-#[cfg(any(co5300, cst9220, st7796, gpio, bme280, max7219))]
+#[cfg(any(co5300, cst9220, st7796, gpio, bme280, max7219, i2s))]
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
     #[cfg(co5300)]
@@ -855,9 +857,78 @@ crate::define_pin_states!(
     (0, 1, false, true, false, 2, None, None, true, false), // led blue
     #[cfg(gpio)]
     (1, 1, false, true, false, 2, None, None, true, false), // led red
+
+    // I2S0 pins for ES8311 audio codec (Waveshare ESP32-C6 Touch AMOLED 2.16).
+    // MCLK output on GPIO19, BCLK output on GPIO20, WS output on GPIO22,
+    // DOUT (TX data) output on GPIO23, DIN (RX data) input on GPIO21.
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_MCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(12),  // I2S_MCLK output signal
+        None,
+        false,
+        false
+    ),
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_BCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(13),  // I2SO_BCK output signal
+        None,
+        false,
+        false
+    ),
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_WS_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(14),  // I2SO_WS output signal
+        None,
+        false,
+        false
+    ),
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_DOUT_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(15),  // I2SO_SD output signal
+        None,
+        false,
+        false
+    ),
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_DIN_GPIO as u8,
+        1,
+        true,
+        false,
+        false,
+        2,
+        None,
+        Some(15),  // I2SI_SD input signal
+        false,
+        false
+    ),
 );
 
-#[cfg(not(any(co5300, cst9220, st7796, gpio, bme280, max7219)))]
+#[cfg(not(any(co5300, cst9220, st7796, gpio, bme280, max7219, i2s)))]
 crate::define_pin_states!(None);
 
 #[cfg(spi_core)]
@@ -1031,6 +1102,93 @@ pub(crate) fn init_gpio() {
     )
     .expect("Failed to register led_r");
 }
+
+#[cfg(i2s)]
+pub(crate) fn init_i2s() {
+    use crate::devices::i2s::I2sDevice;
+    use crate::devices::i2c_core::block_i2c::BlockI2c;
+    use blueos_hal::PlatPeri;
+
+    // Initialize the I2S0 peripheral and register /dev/i2s0.
+    let i2s = get_device!(i2s0);
+    i2s.enable();
+    let device = I2sDevice::new(i2s);
+    if let Err(e) = device.register("i2s0") {
+        kearly_println!("Failed to register I2S0 device: {:?}", e);
+        log::warn!("Failed to register I2S0 device: {:?}", e);
+    } else {
+        kearly_println!("I2S0 audio device registered as /dev/i2s0");
+    }
+
+    // Initialize the ES8311 codec via I2C0 (address 0x18).
+    // This must happen after the I2C bus is up and the I2S clocks are running.
+    if let Ok(i2c_bus) = init_i2c0_bus() {
+        if let Err(e) = init_es8311_codec(i2c_bus) {
+            kearly_println!("Failed to initialize ES8311 codec: {:?}", e);
+            log::warn!("Failed to initialize ES8311 codec: {:?}", e);
+        } else {
+            kearly_println!("ES8311 codec initialized for playback");
+        }
+    } else {
+        kearly_println!("I2C0 bus not available — skipping ES8311 init");
+    }
+}
+
+#[cfg(i2s)]
+fn init_es8311_codec(
+    bus: &alloc::sync::Arc<I2c0Bus>,
+) -> Result<(), blueos_hal::err::HalError> {
+    const ES8311_ADDR: u8 = 0x18;
+
+    // Helper: write one byte to an ES8311 register.
+    let write_reg = |reg: u8, val: u8| -> Result<(), blueos_hal::err::HalError> {
+        bus.intf.0.lock().write_bytes(ES8311_ADDR, &[reg, val], true, true)
+    };
+
+    // ES8311 init sequence for 16kHz/16-bit/I2S-Philips, MCLK=256×fs.
+    // Reset & power on.
+    write_reg(0x00, 0x1F)?; // reset
+    // Small delay to let the codec settle.
+    for _ in 0..100_000 {
+        core::hint::spin_loop();
+    }
+    write_reg(0x00, 0x00)?; // clear reset
+    write_reg(0x00, 0x80)?; // power on, slave serial port
+
+    // Clock source & enable (MCLK from MCLK pin, not inverted, all clocks on).
+    write_reg(0x01, 0x3F)?;
+
+    // Clock dividers for MCLK=4.096MHz (256×16kHz), fs=16kHz.
+    write_reg(0x02, 0x00)?; // pre_div=1, pre_multi=1x
+    write_reg(0x03, 0x10)?; // single speed, adc_osr=0x10
+    write_reg(0x04, 0x10)?; // dac_osr=0x10
+    write_reg(0x05, 0x00)?; // adc_div=1, dac_div=1
+    write_reg(0x06, 0x03)?; // bclk_div=4
+    write_reg(0x07, 0x00)?; // lrck_h=0
+    write_reg(0x08, 0xFF)?; // lrck_l=0xFF
+
+    // I2S format (16-bit, Philips).
+    write_reg(0x09, 0x0C)?; // DAC SDP: I2S, 16-bit
+    write_reg(0x0A, 0x0C)?; // ADC SDP: I2S, 16-bit
+
+    // Power up analog & DAC.
+    write_reg(0x0D, 0x01)?; // power up analog
+    write_reg(0x0E, 0x02)?; // enable analog PGA + ADC modulator
+    write_reg(0x12, 0x00)?; // power-up DAC
+    write_reg(0x13, 0x10)?; // enable HP output driver
+    write_reg(0x1C, 0x6A)?; // ADC EQ bypass, DC offset cancel
+    write_reg(0x37, 0x08)?; // DAC EQ bypass, fade off
+
+    // Unmute & set volume.
+    write_reg(0x31, 0x00)?; // unmute DAC
+    write_reg(0x32, 0xFF)?; // volume = max
+
+    Ok(())
+}
+
+#[cfg(not(i2s))]
+pub(crate) fn init_i2s() {}
+pub(crate) fn init_gpio() {}
 
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}
