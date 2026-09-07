@@ -190,10 +190,12 @@ crate::define_peripheral! {
      blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(5)),
     (rst_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
      blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(4)),
-    (touch_rst_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(21)),
-    (lcd_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    // (touch_rst_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    //  blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(21)),
+    (max7219_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
      blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(20)),
+    (lcd_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(21)),
     (led_b, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
      blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(2)),
     (led_r, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
@@ -240,7 +242,7 @@ crate::define_bus! {
         #[cfg(max7219)]
         (max7219, crate::drivers::display::max7219::Max7219Config<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
             crate::drivers::display::max7219::Max7219Config::<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>::new(
-                get_device!(lcd_cs),
+                get_device!(max7219_cs),
                 1,
                 1,
             )
@@ -325,7 +327,7 @@ crate::define_pin_states!(
     (8, 1, false, false, false, 2, Some(63), None, false, false),  // SCK
     (9, 1, true, false, false, 2, None, Some(64), false, false),   // MISO
     (10, 1, false, false, false, 2, Some(65), None, false, false), // MOSI
-    (20, 1, false, true, false, 2, None, None, true, false),       // lcd cs
+    (20, 1, false, true, false, 2, None, None, true, false),       // max7219 cs
     (5, 1, false, true, false, 2, None, None, true, false),        // lcd dc
     (4, 1, false, true, false, 2, None, None, true, false),        // lcd rst
     (21, 1, false, true, false, 2, None, None, true, false),       // touch rst
