@@ -359,173 +359,6 @@ unsafe fn regi2c_write(block: u8, reg_add: u8, data: u8) {
     regi2c_wait_idle(ctrl);
 }
 
-// BBPLL analog config register offsets on slave 0x66. These constants are the
-// I2C slave register ADDRESSES — taken verbatim from the I2C_BBPLL_OC_* macros
-// in components/soc/esp32c6/include/soc/regi2c_bbpll.h (the macro value IS the
-// i2c reg address; multiple field macros like DR1/DR3 share one address).
-const I2C_BBPLL_OC_REF_DIV: u8 = 0x02;
-const I2C_BBPLL_OC_DIV_7_0: u8 = 0x03;
-const I2C_BBPLL_OC_DR1: u8 = 0x05;
-const I2C_BBPLL_OC_DR3: u8 = 0x05;
-const I2C_BBPLL_OC_DCUR: u8 = 0x06;
-const I2C_BBPLL_OC_VCO_DBIAS: u8 = 0x09;
-const BBPLL_OC_DCUR_40M: u8 = (1 << 6) | (3 << 4) | 3;
-const BBPLL_OC_REF_DIV_40M: u8 = 5 << 4;
-const BBPLL_OC_DIV_7_0_40M: u8 = 8;
-
-/// BBPLL regi2c self-calibration — reproduces rtc_clk_bbpll_configure() in
-/// esp-idf components/esp_hw_support/port/esp32c6/rtc_clk.c:155-171.
-///
-/// Five steps: ① enable ana I2C master clock ② start calibration (clear bit2 /
-/// set bit3) ③ write the BBPLL slave OC_* frequency config (480MHz @ 40MHz XTAL)
-/// ④ poll CAL_DONE (bit24) ⑤ stop calibration (clear bit3 / set bit2) + 10us wait
-/// + disable I2C clock.
-///
-/// The BBPLL is the RF local oscillator source; the bootloader starts it
-/// oscillating but never self-calibrates, so the frequency offset makes RX
-/// unable to demodulate 802.11 frames → scan 0 AP.
-unsafe fn bbpll_calibrate() {
-    // ① Enable ana I2C master clock (regi2c_ctrl_ll_master_enable_clock(true))
-    let v = read32(MODEM_LPCON_CLK_CONF_FOR_I2C);
-    write32(MODEM_LPCON_CLK_CONF_FOR_I2C, v | CLK_I2C_MST_EN_BIT);
-    kearly_println!("[bbpll] step1 clk on");
-
-    // ② Start BBPLL calibration: clear STOP_FORCE_HIGH(bit2), set STOP_FORCE_LOW(bit3)
-    let conf0 = read32(I2C_MST_ANA_CONF0);
-    write32(
-        I2C_MST_ANA_CONF0,
-        (conf0 & !BBPLL_STOP_FORCE_HIGH) | BBPLL_STOP_FORCE_LOW,
-    );
-    kearly_println!(
-        "[bbpll] step2 cal started (conf0=0x{:x})",
-        read32(I2C_MST_ANA_CONF0)
-    );
-
-    // ③ Write BBPLL analog config for 480MHz @ 40MHz XTAL (clk_ll_bbpll_set_config)
-    //    Order matches esp-idf: REF_DIV, DIV_7_0, DR1(RMW), DR3(RMW), DCUR, VCO_DBIAS(RMW)
-    kearly_println!("[bbpll] step3a writing OC_REF_DIV");
-    regi2c_write(REGI2C_BBPLL, I2C_BBPLL_OC_REF_DIV, BBPLL_OC_REF_DIV_40M);
-    kearly_println!("[bbpll] step3b writing OC_DIV_7_0");
-    regi2c_write(REGI2C_BBPLL, I2C_BBPLL_OC_DIV_7_0, BBPLL_OC_DIV_7_0_40M);
-    kearly_println!("[bbpll] step3c writing OC_DR1");
-    regi2c_write_mask(REGI2C_BBPLL, I2C_BBPLL_OC_DR1, 7, 0, 0);
-    kearly_println!("[bbpll] step3d writing OC_DR3");
-    regi2c_write_mask(REGI2C_BBPLL, I2C_BBPLL_OC_DR3, 7, 0, 0);
-    kearly_println!("[bbpll] step3e writing OC_DCUR");
-    regi2c_write(REGI2C_BBPLL, I2C_BBPLL_OC_DCUR, BBPLL_OC_DCUR_40M);
-    kearly_println!("[bbpll] step3f writing OC_VCO_DBIAS");
-    regi2c_write_mask(REGI2C_BBPLL, I2C_BBPLL_OC_VCO_DBIAS, 7, 0, 2);
-    kearly_println!("[bbpll] step3 done");
-
-    // ④ Wait for CAL_DONE (bit24). Bounded loop.
-    // NOTE: on C6, CAL_DONE may read 1 immediately after start — could mean
-    // either (a) calibration genuinely finished fast, or (b) it never truly
-    // started and CAL_DONE is stuck at its default. The readback below
-    // distinguishes the two: if the OC registers we just wrote read back
-    // correctly, the I2C path is real and calibration ran.
-    let mut done = false;
-    for _ in 0..1_000_000 {
-        if (read32(I2C_MST_ANA_CONF0) & BBPLL_CAL_DONE) != 0 {
-            done = true;
-            break;
-        }
-    }
-    kearly_println!(
-        "[bbpll] step4 poll done={} (conf0=0x{:x})",
-        done,
-        read32(I2C_MST_ANA_CONF0)
-    );
-
-    // Diagnostic: read back the six OC registers and compare against the
-    // values we just wrote. This proves whether the BBPLL I2C writes actually
-    // landed in the slave — i.e. whether calibration truly ran vs CAL_DONE
-    // being a stuck-default false positive.
-    //   REF_DIV   expect 0x50  (DCHGP=5<<4 | div_ref=0)
-    //   DIV_7_0   expect 0x08
-    //   DR1|DR3   expect DR1[2:0]=0 and DR3[6:4]=0 in the same byte → low
-    //              nibble 0, high nibble 0 → byte 0x00 (readback may show
-    //              other reserved bits set, so mask DR1 field [2:0] and
-    //              DR3 field [6:4] separately)
-    //   DCUR      expect 0x73  (DLREF_SEL=1<<6 | DHREF_SEL=3<<4 | dcur=3)
-    //   VCO_DBIAS expect field[1:0]=2 (full byte 0x02)
-    let rb_refdiv = regi2c_read(REGI2C_BBPLL, I2C_BBPLL_OC_REF_DIV);
-    let rb_div7 = regi2c_read(REGI2C_BBPLL, I2C_BBPLL_OC_DIV_7_0);
-    let rb_dr = regi2c_read(REGI2C_BBPLL, I2C_BBPLL_OC_DR1); // same addr as DR3
-    let rb_dcur = regi2c_read(REGI2C_BBPLL, I2C_BBPLL_OC_DCUR);
-    let rb_dbias = regi2c_read(REGI2C_BBPLL, I2C_BBPLL_OC_VCO_DBIAS);
-    kearly_println!(
-        "[bbpll] readback: refdiv=0x{:02x}(exp 0x50) div7=0x{:02x}(exp 0x08) dr=0x{:02x}(exp dr1[2:0]=0 dr3[6:4]=0) dcur=0x{:02x}(exp 0x73) dbias=0x{:02x}(exp [1:0]=2)",
-        rb_refdiv, rb_div7, rb_dr, rb_dcur, rb_dbias
-    );
-
-    // esp_rom_delay_us(10) — RTC hardware settle after calibration completes
-    kearly_println!("[bbpll] step5 ets_delay_us(10) enter");
-    unsafe { ets_delay_us(10) };
-    kearly_println!("[bbpll] step5 ets_delay_us(10) exit");
-
-    // ⑤ Stop calibration: clear STOP_FORCE_LOW(bit3), set STOP_FORCE_HIGH(bit2)
-    let conf0 = read32(I2C_MST_ANA_CONF0);
-    write32(
-        I2C_MST_ANA_CONF0,
-        (conf0 & !BBPLL_STOP_FORCE_LOW) | BBPLL_STOP_FORCE_HIGH,
-    );
-
-    // Diagnostic: report CAL_DONE state + final CONF0 value so the user can
-    // confirm the calibration actually completed rather than timing out.
-    let conf0_final = read32(I2C_MST_ANA_CONF0);
-    kearly_println!(
-        "[bbpll] calibration done={} (CAL_DONE=b{}), conf0=0x{:x} \
-         (stop_hi=b{}, stop_lo=b{})",
-        done,
-        (conf0_final >> 24) & 1,
-        conf0_final,
-        (conf0_final >> 2) & 1,
-        (conf0_final >> 3) & 1,
-    );
-
-    // Disable ana I2C master clock (rtc_clk_enable_i2c_ana_master_clock(false)).
-    // Note: esp-phy enable_phy() re-enables it later during PHY calibration,
-    // so turning it off here matches esp-idf's post-calibration state.
-    let v = read32(MODEM_LPCON_CLK_CONF_FOR_I2C);
-    write32(MODEM_LPCON_CLK_CONF_FOR_I2C, v & !CLK_I2C_MST_EN_BIT);
-}
-
-/// regi2c ENIF four bits — reproduces pmu_init.c:214-217 in esp-idf
-/// components/esp_hw_support/port/esp32c6/pmu_init.c. Writes I2C_DIG_REG(0x6D)
-/// slave to enable the digital/rtc regulator self-calibration path:
-///   reg5  bit7 = 1  ENIF_RTC_DREG  (enable rtc dreg self-cal)
-///   reg7  bit7 = 1  ENIF_DIG_DREG  (enable dig dreg self-cal)
-///   reg13 bit2 = 0  XPD_RTC_REG    (0 = let self-cal drive rtc voltage)
-///   reg13 bit3 = 0  XPD_DIG_REG    (0 = let self-cal drive dig voltage)
-/// These let the on-chip regulator settle to the calibrated voltage instead of
-/// the reset default, complementing the dbias set in ⑥.
-unsafe fn regi2c_enif_init() {
-    // reg5 bit7 = 1 (ENIF_RTC_DREG, msb=lsb=7)
-    regi2c_write_mask(REGI2C_DIG_REG, 5, 7, 7, 1);
-    // reg7 bit7 = 1 (ENIF_DIG_DREG, msb=lsb=7)
-    regi2c_write_mask(REGI2C_DIG_REG, 7, 7, 7, 1);
-    // reg13 bit2 = 0 (XPD_RTC_REG, msb=lsb=2)
-    regi2c_write_mask(REGI2C_DIG_REG, 13, 2, 2, 0);
-    // reg13 bit3 = 0 (XPD_DIG_REG, msb=lsb=3)
-    regi2c_write_mask(REGI2C_DIG_REG, 13, 3, 3, 0);
-
-    // Readback to confirm the four bits actually landed (analog bus could NACK).
-    let r5 = regi2c_read(REGI2C_DIG_REG, 5);
-    let r7 = regi2c_read(REGI2C_DIG_REG, 7);
-    let r13 = regi2c_read(REGI2C_DIG_REG, 13);
-    kearly_println!(
-        "[enif] dig_reg readback: reg5=0x{:02x}(enif_rtc=b{}) \
-         reg7=0x{:02x}(enif_dig=b{}) reg13=0x{:02x}(xpd_rtc=b{}, xpd_dig=b{})",
-        r5,
-        (r5 >> 7) & 1,
-        r7,
-        (r7 >> 7) & 1,
-        r13,
-        (r13 >> 2) & 1,
-        (r13 >> 3) & 1,
-    );
-}
-
 pub(crate) fn handle_intc_irq(ctx: &Context, mcause: usize, mtval: usize) {
     let _ = (ctx, mtval);
     match mcause & 0xff {
@@ -581,16 +414,6 @@ pub(crate) fn init() {
         route_source(INTMTX_USB_SERIAL_JTAG_MAP, USB_SERIAL_JTAG_INT_NUM, 15);
         route_source(INTMTX_SYSTIMER_TARGET0_MAP, TARGET0_INT_NUM, 15);
     }
-
-    // unsafe {
-    //     core::arch::asm!(
-    //         "csrc mideleg, {mask}",
-    //         mask = in(reg) MIDELEG_DELEG_MASK,
-    //         options(nostack, preserves_flags),
-    //     );
-    // }
-
-    //crate::time::Tick::interrupt_after(crate::time::Tick(1));
 
     // ------------------------------------------------------------------
     // System clock tree configure(): MSPI HS divider + SOC_ROOT_CLK selection.
@@ -768,10 +591,6 @@ pub(crate) fn init() {
             MODEM_LPCON_WIFI_LP_CLK_CONF,
             (v & !LPCON_LP_DIV_NUM_MASK) | LPCON_LP_CLK_SEL_MASK,
         );
-
-        // Verification
-        // regi2c_enif_init();
-        // bbpll_calibrate();
     }
 }
 
