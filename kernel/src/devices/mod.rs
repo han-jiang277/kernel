@@ -34,6 +34,8 @@ pub mod clock;
 pub mod console;
 mod error;
 pub mod framebuffer;
+#[cfg(i2s)]
+pub mod gdma_test;
 pub mod gpio;
 #[cfg(i2s)]
 pub mod i2s;

@@ -1108,6 +1108,11 @@ pub(crate) fn init_i2s() {
     use crate::devices::i2s::I2sDevice;
     use crate::devices::i2c_core::block_i2c::BlockI2c;
     use blueos_hal::PlatPeri;
+    use blueos_driver::dma::esp32c6_gdma::Esp32c6GdmaChannel;
+
+    // Initialize the GDMA controller before any DMA user (I2S, M2M test).
+    // This enables the DMA register clock and resets the AHB master FSM.
+    Esp32c6GdmaChannel::<2>::init_dma();
 
     // Initialize the I2S0 peripheral and register /dev/i2s0.
     let i2s = get_device!(i2s0);
@@ -1118,6 +1123,15 @@ pub(crate) fn init_i2s() {
         log::warn!("Failed to register I2S0 device: {:?}", e);
     } else {
         kearly_println!("I2S0 audio device registered as /dev/i2s0");
+    }
+
+    // Register the GDMA M2M self-test device as /dev/gdma_test.
+    let gdma_test = crate::devices::gdma_test::GdmaTestDevice::new();
+    if let Err(e) = gdma_test.register() {
+        kearly_println!("Failed to register GDMA test device: {:?}", e);
+        log::warn!("Failed to register GDMA test device: {:?}", e);
+    } else {
+        kearly_println!("GDMA test device registered as /dev/gdma_test");
     }
 
     // Initialize the ES8311 codec via I2C0 (address 0x18).

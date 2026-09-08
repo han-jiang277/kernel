@@ -30,12 +30,104 @@ use tock_registers::{
     registers::{ReadOnly, ReadWrite, WriteOnly},
 };
 
+/// Per-channel GDMA register snapshot captured at the point of failure.
+#[derive(Copy, Clone)]
+pub struct GdmaChStatus {
+    pub in_raw: u32,
+    pub out_raw: u32,
+    pub in_conf0: u32,
+    pub in_link: u32,
+    pub in_state: u32,
+    pub out_conf0: u32,
+    pub out_link: u32,
+    pub out_state: u32,
+}
+
+/// Diagnostic snapshot of the GDMA controller: one entry per channel (3 on
+/// ESP32-C6) plus the global MISC_CONF register.
+#[derive(Copy, Clone)]
+pub struct GdmaStatus {
+    pub channels: [GdmaChStatus; 3],
+    pub misc_conf: u32,
+}
+
+impl core::fmt::Display for GdmaStatus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (ch, s) in self.channels.iter().enumerate() {
+            write!(
+                f,
+                "CH{} IN_RAW=0x{:08x} OUT_RAW=0x{:08x} | ",
+                ch, s.in_raw, s.out_raw
+            )?;
+        }
+        for (ch, s) in self.channels.iter().enumerate() {
+            write!(
+                f,
+                "CH{} IN[c0=0x{:08x} lk=0x{:08x} st=0x{:08x}] OUT[c0=0x{:08x} lk=0x{:08x} st=0x{:08x}] | ",
+                ch,
+                s.in_conf0,
+                s.in_link,
+                s.in_state,
+                s.out_conf0,
+                s.out_link,
+                s.out_state
+            )?;
+        }
+        write!(f, "MISC=0x{:08x}", self.misc_conf)
+    }
+}
+
+/// Capture the interrupt RAW registers and channel state for all 3 GDMA
+/// channels. Called on timeout/error and returned to the caller for logging.
+pub fn capture_gdma_status() -> GdmaStatus {
+    let mut channels = [GdmaChStatus {
+        in_raw: 0,
+        out_raw: 0,
+        in_conf0: 0,
+        in_link: 0,
+        in_state: 0,
+        out_conf0: 0,
+        out_link: 0,
+        out_state: 0,
+    }; 3];
+
+    for ch in 0..3usize {
+        let in_raw = unsafe {
+            core::ptr::read_volatile((DMA_BASE + IN_INT_BASE + ch * INT_STRIDE) as *const u32)
+        };
+        let out_raw = unsafe {
+            core::ptr::read_volatile((DMA_BASE + OUT_INT_BASE + ch * INT_STRIDE) as *const u32)
+        };
+        let ch_base = DMA_BASE + CH_OFFSET + ch * CH_STRIDE;
+        let in_conf0 = unsafe { core::ptr::read_volatile((ch_base + 0x00) as *const u32) };
+        let in_link = unsafe { core::ptr::read_volatile((ch_base + 0x10) as *const u32) };
+        let in_state = unsafe { core::ptr::read_volatile((ch_base + 0x14) as *const u32) };
+        let out_conf0 = unsafe { core::ptr::read_volatile((ch_base + 0x60) as *const u32) };
+        let out_link = unsafe { core::ptr::read_volatile((ch_base + 0x70) as *const u32) };
+        let out_state = unsafe { core::ptr::read_volatile((ch_base + 0x74) as *const u32) };
+        channels[ch] = GdmaChStatus {
+            in_raw,
+            out_raw,
+            in_conf0,
+            in_link,
+            in_state,
+            out_conf0,
+            out_link,
+            out_state,
+        };
+    }
+
+    let misc_conf = unsafe { core::ptr::read_volatile((DMA_BASE + 0x64) as *const u32) };
+
+    GdmaStatus { channels, misc_conf }
+}
+
 /// GDMA base address on ESP32-C6.
 const DMA_BASE: usize = 0x6008_0000;
 
 /// Per-channel register stride (CH[n] starts at `0x70 + n * 0x80`).
 const CH_OFFSET: usize = 0x70;
-const CH_STRIDE: usize = 0x80;
+const CH_STRIDE: usize = 0xC0;
 
 /// IN_INT_CH[n] stride: each cluster is 0x10 (RAW, ST, ENA, CLR).
 const IN_INT_BASE: usize = 0x00;
@@ -54,9 +146,13 @@ register_bitfields! [
 
     /// RX (input) interrupt bits — shared by RAW / ST / ENA / CLR.
     pub InInt [
-        IN_DONE     OFFSET(0) NUMBITS(1) [],
-        IN_SUC_EOF  OFFSET(1) NUMBITS(1) [],
-        IN_DSCR_ERR OFFSET(3) NUMBITS(1) [],
+        IN_DONE       OFFSET(0) NUMBITS(1) [],
+        IN_SUC_EOF    OFFSET(1) NUMBITS(1) [],
+        IN_ERR_EOF    OFFSET(2) NUMBITS(1) [],
+        IN_DSCR_ERR   OFFSET(3) NUMBITS(1) [],
+        IN_DSCR_EMPTY OFFSET(4) NUMBITS(1) [],
+        INFIFO_OVF    OFFSET(5) NUMBITS(1) [],
+        INFIFO_UDF    OFFSET(6) NUMBITS(1) [],
     ],
 
     /// TX (output) interrupt bits — shared by RAW / ST / ENA / CLR.
@@ -65,6 +161,8 @@ register_bitfields! [
         OUT_EOF       OFFSET(1) NUMBITS(1) [],
         OUT_DSCR_ERR  OFFSET(2) NUMBITS(1) [],
         OUT_TOTAL_EOF OFFSET(3) NUMBITS(1) [],
+        OUTFIFO_OVF   OFFSET(4) NUMBITS(1) [],
+        OUTFIFO_UDF   OFFSET(5) NUMBITS(1) [],
     ],
 
     /// RX channel configure 0.
@@ -78,6 +176,7 @@ register_bitfields! [
     /// TX channel configure 0.
     pub OutConf0 [
         OUT_RST           OFFSET(0) NUMBITS(1) [],
+        OUT_AUTO_WRBACK   OFFSET(2) NUMBITS(1) [],
         OUT_EOF_MODE      OFFSET(3) NUMBITS(1) [],
         OUTDSCR_BURST_EN  OFFSET(4) NUMBITS(1) [],
         OUT_DATA_BURST_EN OFFSET(5) NUMBITS(1) [],
@@ -103,6 +202,13 @@ register_bitfields! [
     pub PeriSel [
         PERI_SEL OFFSET(0) NUMBITS(6) [],
     ],
+
+    /// MISC_CONF — global DMA configuration (offset 0x64).
+    pub MiscConf [
+        AHBM_RST_INTER OFFSET(0) NUMBITS(1) [],
+        ARB_PRI_DIS    OFFSET(2) NUMBITS(1) [],
+        CLK_EN         OFFSET(3) NUMBITS(1) [],
+    ],
 ];
 
 register_structs! {
@@ -121,6 +227,22 @@ register_structs! {
 }
 
 register_structs! {
+    /// Global DMA registers (before the per-channel blocks).
+    ///
+    /// Layout: IN_INT_CH[0..3] (0x00..0x30), OUT_INT_CH[0..3]
+    /// (0x30..0x60), AHB_TEST (0x60), MISC_CONF (0x64), DATE (0x68).
+    pub DmaGlobal {
+        (0x00 => _in_int_ch),
+        (0x30 => _out_int_ch),
+        (0x60 => _ahb_test),
+        (0x64 => misc_conf: ReadWrite<u32, MiscConf::Register>),
+        (0x68 => _date),
+        (0x6c => _reserved),
+        (0x70 => @END),
+    }
+}
+
+register_structs! {
     /// One DMA channel register block (CH[n]).
     ///
     /// The RX (input) side occupies the first 0x60 bytes; a 0x2c-byte reserved
@@ -132,7 +254,7 @@ register_structs! {
         (0x08 => _infifo_status),
         (0x0c => _in_pop),
         (0x10 => in_link: ReadWrite<u32, InLink::Register>),
-        (0x14 => _in_state),
+        (0x14 => in_state: ReadOnly<u32>),
         (0x18 => _in_suc_eof_des_addr),
         (0x1c => _in_err_eof_des_addr),
         (0x20 => _in_dscr),
@@ -147,7 +269,7 @@ register_structs! {
         (0x68 => _outfifo_status),
         (0x6c => _out_push),
         (0x70 => out_link: ReadWrite<u32, OutLink::Register>),
-        (0x74 => _out_state),
+        (0x74 => out_state: ReadOnly<u32>),
         (0x78 => _out_eof_des_addr),
         (0x7c => _out_eof_bfr_des_addr),
         (0x80 => _out_dscr),
@@ -162,7 +284,12 @@ register_structs! {
 
 /// ESP32-C6 GDMA linked-list descriptor (3 words = 12 bytes).
 ///
-/// `dw0` packs: `length[11:0] | size[23:12] | suc_eof[24] | owner[25]`.
+/// `dw0` bitfield layout (per ESP32-C6 TRM and esp-hal):
+/// - `size[11:0]`   — buffer capacity (set by software)
+/// - `length[23:12]` — valid bytes (TX: set by SW; RX: written by HW)
+/// - `suc_eof[30]`   — success EOF flag
+/// - `owner[31]`     — 1 = owned by DMA, 0 = owned by CPU
+///
 /// `buffer` is the data buffer address (word-aligned, internal SRAM).
 /// `next` is the next descriptor address, or null for end-of-list.
 #[repr(C, align(4))]
@@ -172,27 +299,34 @@ pub struct DmaDescriptor {
     pub next: *mut DmaDescriptor,
 }
 
+/// `dw0` bit positions.
+const DW0_SIZE_MASK: u32 = 0xfff;
+const DW0_SIZE_SHIFT: u32 = 0;
+const DW0_LENGTH_SHIFT: u32 = 12;
+const DW0_SUC_EOF: u32 = 1 << 30;
+const DW0_OWNER_DMA: u32 = 1 << 31;
+
 impl DmaDescriptor {
     /// Build a TX descriptor for `buf`. `suc_eof` marks the last descriptor so
-    /// GDMA raises `OUT_TOTAL_EOF` after consuming it.
+    /// GDMA raises `OUT_TOTAL_EOF` after consuming it. Ownership is set to DMA.
     pub const fn for_tx(buf: *mut u8, len: usize, suc_eof: bool) -> Self {
-        let size = len as u32;
-        let eof = if suc_eof { 1 << 24 } else { 0 };
-        // owner = 0 (DMA) — the CPU hands the buffer to DMA by clearing owner.
+        let size = (len as u32) & DW0_SIZE_MASK;
+        let length = (len as u32) << DW0_LENGTH_SHIFT;
+        let eof = if suc_eof { DW0_SUC_EOF } else { 0 };
         DmaDescriptor {
-            dw0: (size << 12) | eof,
+            dw0: size | length | eof | DW0_OWNER_DMA,
             buffer: buf,
             next: core::ptr::null_mut(),
         }
     }
 
     /// Build an RX descriptor for `buf`. `size` is the capacity; after the
-    /// transfer completes, `length` (bits 11:0 of `dw0`) holds the received
-    /// byte count.
+    /// transfer completes, `length` (bits 23:12 of `dw0`) holds the received
+    /// byte count. Ownership is set to DMA.
     pub const fn for_rx(buf: *mut u8, capacity: usize) -> Self {
-        let size = capacity as u32;
+        let size = (capacity as u32) & DW0_SIZE_MASK;
         DmaDescriptor {
-            dw0: size << 12,
+            dw0: size | DW0_OWNER_DMA,
             buffer: buf,
             next: core::ptr::null_mut(),
         }
@@ -200,7 +334,7 @@ impl DmaDescriptor {
 
     /// Received byte count (valid after an RX transfer).
     pub fn received_len(&self) -> usize {
-        (self.dw0 & 0xfff) as usize
+        ((self.dw0 >> DW0_LENGTH_SHIFT) & DW0_SIZE_MASK) as usize
     }
 }
 
@@ -251,6 +385,22 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         Self {}
     }
 
+    /// Initialize the GDMA controller: reset the AHB master interface and
+    /// force-enable the register clock.
+    ///
+    /// This must be called once before any DMA transfer. It mirrors esp-hal's
+    /// `init_dma_racey()`. Without `CLK_EN = 1`, the DMA engine's register
+    /// clock is only active during CPU writes, which can cause transfers to
+    /// stall indefinitely.
+    pub fn init_dma() {
+        let global = unsafe { &*(DMA_BASE as *const DmaGlobal) };
+        // Reset the AHB master FSM, then release.
+        global.misc_conf.modify(MiscConf::AHBM_RST_INTER::SET);
+        global.misc_conf.modify(MiscConf::AHBM_RST_INTER::CLEAR);
+        // Force clock on for all DMA registers.
+        global.misc_conf.modify(MiscConf::CLK_EN::SET);
+    }
+
     // ---- RX (input: peripheral → memory) ----
 
     /// Reset the RX FSM and FIFO.
@@ -274,11 +424,14 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         // Clear any pending RX interrupt status.
         let int = in_int_regs::<CH>();
         int.clr.set(InInt::IN_DONE.val(1).value | InInt::IN_SUC_EOF.val(1).value | InInt::IN_DSCR_ERR.val(1).value);
-        // Write the descriptor address into INLINK_ADDR and kick off.
+        // Ensure descriptor writes are visible to the DMA engine before start.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Set the descriptor address and kick off — use modify() to preserve
+        // other fields (e.g. INLINK_AUTO_RET). Do NOT set RESTART.
         let ch = channel_regs::<CH>();
         let desc_addr = (addr_of!(*desc) as usize as u32) & ((1 << 20) - 1);
-        ch.in_link.write(InLink::INLINK_ADDR.val(desc_addr) + InLink::INLINK_RESTART::SET);
-        ch.in_link.write(InLink::INLINK_ADDR.val(desc_addr) + InLink::INLINK_START::SET);
+        ch.in_link.modify(InLink::INLINK_ADDR.val(desc_addr));
+        ch.in_link.modify(InLink::INLINK_START::SET);
     }
 
     /// Returns `true` once the RX transfer has completed (`IN_SUC_EOF`).
@@ -287,9 +440,13 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
     }
 
     /// Block until the RX transfer completes. Returns `Err` on timeout or
-    /// descriptor error.
+    /// descriptor error. On error the caller may invoke
+    /// [`capture_gdma_status`] to obtain a diagnostic snapshot for logging.
     pub fn wait_rx_done() -> blueos_hal::err::Result<()> {
         let int = in_int_regs::<CH>();
+        let mask = InInt::IN_SUC_EOF.mask
+            | InInt::IN_DSCR_ERR.mask
+            | InInt::IN_DSCR_EMPTY.mask;
         loop {
             let raw = int.raw.get();
             if raw & InInt::IN_SUC_EOF.mask != 0 {
@@ -298,7 +455,10 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
             if raw & InInt::IN_DSCR_ERR.mask != 0 {
                 return Err(blueos_hal::err::HalError::Fail);
             }
-            if !wait_for_bit(int, InInt::IN_SUC_EOF.mask | InInt::IN_DSCR_ERR.mask) {
+            if raw & InInt::IN_DSCR_EMPTY.mask != 0 {
+                return Err(blueos_hal::err::HalError::Fail);
+            }
+            if !wait_for_bit(int, mask) {
                 return Err(blueos_hal::err::HalError::Timeout);
             }
         }
@@ -327,10 +487,14 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         // Clear any pending TX interrupt status.
         let int = out_int_regs::<CH>();
         int.clr.set(OutInt::OUT_DONE.val(1).value | OutInt::OUT_EOF.val(1).value | OutInt::OUT_TOTAL_EOF.val(1).value | OutInt::OUT_DSCR_ERR.val(1).value);
+        // Ensure descriptor writes are visible to the DMA engine before start.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // Set the descriptor address and kick off — use modify() to preserve
+        // other fields. Do NOT set RESTART — it reuses the *previous* address.
         let ch = channel_regs::<CH>();
         let desc_addr = (addr_of!(*desc) as usize as u32) & ((1 << 20) - 1);
-        ch.out_link.write(OutLink::OUTLINK_ADDR.val(desc_addr) + OutLink::OUTLINK_RESTART::SET);
-        ch.out_link.write(OutLink::OUTLINK_ADDR.val(desc_addr) + OutLink::OUTLINK_START::SET);
+        ch.out_link.modify(OutLink::OUTLINK_ADDR.val(desc_addr));
+        ch.out_link.modify(OutLink::OUTLINK_START::SET);
     }
 
     /// Returns `true` once the TX transfer has completed (`OUT_TOTAL_EOF`).
@@ -339,7 +503,8 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
     }
 
     /// Block until the TX transfer completes. Returns `Err` on timeout or
-    /// descriptor error.
+    /// descriptor error. On error the caller may invoke
+    /// [`capture_gdma_status`] to obtain a diagnostic snapshot for logging.
     pub fn wait_tx_done() -> blueos_hal::err::Result<()> {
         let int = out_int_regs::<CH>();
         loop {
@@ -354,6 +519,104 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
                 return Err(blueos_hal::err::HalError::Timeout);
             }
         }
+    }
+
+    // ---- M2M (memory-to-memory) self-test ----
+
+    /// Run a memory-to-memory DMA transfer to verify both outlink (read) and
+    /// inlink (write) paths without any peripheral attached.
+    ///
+    /// `src` is the source buffer (read by outlink), `dst` is the destination
+    /// buffer (written by inlink). Both must be word-aligned and reside in
+    /// internal SRAM. The caller fills `src` with a known pattern and zeroes
+    /// `dst` before calling; after `Ok(())` returns, `dst` should match `src`.
+    ///
+    /// This method uses the same channel for both TX and RX: it sets
+    /// `MEM_TRANS_EN`, starts the outlink first (to feed data into the DMA
+    /// internal FIFO), then starts the inlink (to drain the FIFO into `dst`).
+    pub fn m2m_transfer(src: &mut [u8], dst: &mut [u8]) -> blueos_hal::err::Result<()> {
+        if src.len() != dst.len() || src.is_empty() {
+            return Err(blueos_hal::err::HalError::InvalidParam);
+        }
+        let len = src.len();
+
+        // Ensure the GDMA controller clock is enabled (idempotent).
+        Self::init_dma();
+
+        let ch = channel_regs::<CH>();
+
+        // ── TRM Step 1: Reset TX FSM and FIFO pointer ──
+        ch.out_conf0.modify(OutConf0::OUT_RST::SET);
+        ch.out_conf0.modify(OutConf0::OUT_RST::CLEAR);
+
+        // ── TRM Step 2: Reset RX FSM and FIFO pointer ──
+        ch.in_conf0.modify(InConf0::IN_RST::SET);
+        ch.in_conf0.modify(InConf0::IN_RST::CLEAR);
+
+        // Select SPI2 (peri_id = 0) as the pseudo-peripheral for both
+        // directions. In M2M mode the hardware ignores the peripheral FIFO,
+        // but esp-hal still sets peri_sel — we match that to be safe.
+        Self::set_tx_peri(1);
+        Self::set_rx_peri(1);
+
+        // Enable descriptor burst reads on both sides.
+        ch.out_conf0.modify(
+            OutConf0::OUTDSCR_BURST_EN::SET
+                + OutConf0::OUT_EOF_MODE::SET,
+        );
+        ch.in_conf0.modify(InConf0::INDSCR_BURST_EN::SET);
+
+        // Build descriptors: outlink reads from `src`, inlink writes to `dst`.
+        // Both descriptors have owner = DMA (bit 31 set) so the hardware will
+        // process them. The TX descriptor has suc_eof = 1 (TRM step 8).
+        let tx_desc = DmaDescriptor::for_tx(src.as_ptr() as *mut u8, len, true);
+        let rx_desc = DmaDescriptor::for_rx(dst.as_mut_ptr(), len);
+
+        // Ensure descriptor writes are visible to the DMA engine before start.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // Clear pending interrupts.
+        let in_int = in_int_regs::<CH>();
+        in_int.clr.set(
+            InInt::IN_DONE.val(1).value
+                | InInt::IN_SUC_EOF.val(1).value
+                | InInt::IN_ERR_EOF.val(1).value
+                | InInt::IN_DSCR_ERR.val(1).value
+                | InInt::IN_DSCR_EMPTY.val(1).value,
+        );
+        let out_int = out_int_regs::<CH>();
+        out_int.clr.set(
+            OutInt::OUT_DONE.val(1).value
+                | OutInt::OUT_EOF.val(1).value
+                | OutInt::OUT_TOTAL_EOF.val(1).value
+                | OutInt::OUT_DSCR_ERR.val(1).value,
+        );
+
+        // ── TRM Step 3: Mount TX outlink — set OUTLINK_ADDR ──
+        let tx_desc_addr = (addr_of!(tx_desc) as usize as u32) & ((1 << 20) - 1);
+        ch.out_link.modify(OutLink::OUTLINK_ADDR.val(tx_desc_addr));
+
+        // ── TRM Step 4: Mount RX inlink — set INLINK_ADDR ──
+        let rx_desc_addr = (addr_of!(rx_desc) as usize as u32) & ((1 << 20) - 1);
+        ch.in_link.modify(InLink::INLINK_ADDR.val(rx_desc_addr));
+
+        // ── TRM Step 5: Enable memory-to-memory mode ──
+        ch.in_conf0.modify(InConf0::MEM_TRANS_EN::SET);
+
+        // ── TRM Step 6: Start TX channel — OUTLINK_START ──
+        ch.out_link.modify(OutLink::OUTLINK_START::SET);
+
+        // ── TRM Step 7: Start RX channel — INLINK_START ──
+        ch.in_link.modify(InLink::INLINK_START::SET);
+
+        // ── TRM Step 8: Wait for IN_SUC_EOF (TX descriptor's suc_eof
+        //                propagates through M2M to trigger IN_SUC_EOF) ──
+        let result = Self::wait_rx_done();
+
+        // Clean up: disable M2M mode.
+        ch.in_conf0.modify(InConf0::MEM_TRANS_EN::CLEAR);
+
+        result
     }
 }
 
