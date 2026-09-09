@@ -453,12 +453,15 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
                 return Ok(());
             }
             if raw & InInt::IN_DSCR_ERR.mask != 0 {
+                log::warn!("[GDMA] RX DSCR_ERR, raw=0x{:08x}", raw);
                 return Err(blueos_hal::err::HalError::Fail);
             }
             if raw & InInt::IN_DSCR_EMPTY.mask != 0 {
+                log::warn!("[GDMA] RX DSCR_EMPTY, raw=0x{:08x}", raw);
                 return Err(blueos_hal::err::HalError::Fail);
             }
             if !wait_for_bit(int, mask) {
+                log::warn!("[GDMA] RX timeout, raw=0x{:08x}", int.raw.get());
                 return Err(blueos_hal::err::HalError::Timeout);
             }
         }
@@ -513,15 +516,38 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
                 return Ok(());
             }
             if raw & OutInt::OUT_DSCR_ERR.mask != 0 {
+                log::warn!("[GDMA] TX DSCR_ERR, raw=0x{:08x}", raw);
                 return Err(blueos_hal::err::HalError::Fail);
             }
             if !wait_for_bit(int, OutInt::OUT_TOTAL_EOF.mask | OutInt::OUT_DSCR_ERR.mask) {
+                log::warn!("[GDMA] TX timeout, raw=0x{:08x}", int.raw.get());
                 return Err(blueos_hal::err::HalError::Timeout);
             }
         }
     }
 
     // ---- M2M (memory-to-memory) self-test ----
+
+    /// Dump channel register state for debugging.
+    pub fn dump_channel_state() {
+        let ch = channel_regs::<CH>();
+        log::info!(
+            "[GDMA ch{}] in_conf0=0x{:08x} in_link=0x{:08x} in_peri_sel=0x{:08x} in_state=0x{:08x}",
+            CH,
+            ch.in_conf0.get(),
+            ch.in_link.get(),
+            ch.in_peri_sel.get(),
+            ch.in_state.get()
+        );
+        log::info!(
+            "[GDMA ch{}] out_conf0=0x{:08x} out_link=0x{:08x} out_peri_sel=0x{:08x} out_state=0x{:08x}",
+            CH,
+            ch.out_conf0.get(),
+            ch.out_link.get(),
+            ch.out_peri_sel.get(),
+            ch.out_state.get()
+        );
+    }
 
     /// Run a memory-to-memory DMA transfer to verify both outlink (read) and
     /// inlink (write) paths without any peripheral attached.

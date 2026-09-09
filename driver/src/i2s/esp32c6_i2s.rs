@@ -35,7 +35,7 @@ use tock_registers::{
 };
 
 /// I2S0 peripheral base address on ESP32-C6.
-const I2S0_BASE: usize = 0x6000_c000;
+const I2S0_BASE: usize = 0x6000_C000;
 /// PCR (Peripheral Clock Reset) base address on ESP32-C6.
 const PCR_BASE: usize = 0x6009_6000;
 /// XTAL frequency on ESP32-C6 (40 MHz).
@@ -64,6 +64,7 @@ register_bitfields! [
         TX_MONO        OFFSET(5)  NUMBITS(1) [],
         TX_CHAN_EQUAL  OFFSET(6)  NUMBITS(1) [],
         TX_UPDATE       OFFSET(8)  NUMBITS(1) [],
+        TX_MONO_FST_VLD OFFSET(9) NUMBITS(1) [],
         TX_PCM_BYPASS  OFFSET(12) NUMBITS(1) [],
         TX_STOP_EN     OFFSET(13) NUMBITS(1) [],
         TX_TDM_EN      OFFSET(19) NUMBITS(1) [],
@@ -74,15 +75,17 @@ register_bitfields! [
 
     /// I2S RX configuration register.
     pub RxConf [
-        RX_RESET       OFFSET(0)  NUMBITS(1) [],
-        RX_FIFO_RESET  OFFSET(1)  NUMBITS(1) [],
-        RX_START       OFFSET(2)  NUMBITS(1) [],
-        RX_SLAVE_MOD   OFFSET(3)  NUMBITS(1) [],
-        RX_MONO        OFFSET(5)  NUMBITS(1) [],
-        RX_UPDATE       OFFSET(8)  NUMBITS(1) [],
-        RX_PCM_BYPASS  OFFSET(12) NUMBITS(1) [],
-        RX_TDM_EN      OFFSET(19) NUMBITS(1) [],
-        RX_PDM_EN      OFFSET(20) NUMBITS(1) [],
+        RX_RESET        OFFSET(0)  NUMBITS(1) [],
+        RX_FIFO_RESET   OFFSET(1)  NUMBITS(1) [],
+        RX_START        OFFSET(2)  NUMBITS(1) [],
+        RX_SLAVE_MOD    OFFSET(3)  NUMBITS(1) [],
+        RX_MONO         OFFSET(5)  NUMBITS(1) [],
+        RX_UPDATE        OFFSET(8)  NUMBITS(1) [],
+        RX_MONO_FST_VLD OFFSET(9)  NUMBITS(1) [],
+        RX_PCM_BYPASS   OFFSET(12) NUMBITS(1) [],
+        RX_STOP_MODE    OFFSET(13) NUMBITS(2) [],
+        RX_TDM_EN       OFFSET(19) NUMBITS(1) [],
+        RX_PDM_EN       OFFSET(20) NUMBITS(1) [],
     ],
 
     /// I2S TX_CONF1 / RX_CONF1 — bit-clock divider, data width, half-sample
@@ -94,6 +97,7 @@ register_bitfields! [
         HALF_SAMPLE_BITS  OFFSET(18) NUMBITS(6)  [],
         TDM_CHAN_BITS     OFFSET(24) NUMBITS(5)  [],
         MSB_SHIFT         OFFSET(29) NUMBITS(1)  [],
+        BCK_NO_DLY        OFFSET(30) NUMBITS(1)  [],
     ],
 
     /// I2S TX/RX TDM control register.
@@ -163,9 +167,9 @@ register_structs! {
         (0x00 => _reserved0),
         (0x6c => i2s_conf: ReadWrite<u32, PcrI2sConf::Register>),
         (0x70 => i2s_tx_clkm_conf: ReadWrite<u32, PcrI2sClkmConf::Register>),
-        (0x74 => _i2s_tx_clkm_div_conf),
+        (0x74 => i2s_tx_clkm_div_conf: ReadWrite<u32>),
         (0x78 => i2s_rx_clkm_conf: ReadWrite<u32, PcrI2sClkmConf::Register>),
-        (0x7c => _i2s_rx_clkm_div_conf),
+        (0x7c => i2s_rx_clkm_div_conf: ReadWrite<u32>),
         (0x80 => @END),
     }
 }
@@ -259,41 +263,69 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
                 + PcrI2sClkmConf::I2S_MCLK_SEL.val(1),
         );
 
+        // Configure fractional clock divider for integer division.
+        // For integer MCLK division (no fractional part), the divider must
+        // be programmed with x=0, y=0, z=0, yn1=1 (register value 0x0800_0000).
+        // The hardware reset default (0x00000200, DIV_Z=512) configures an
+        // incorrect fractional divider that prevents MCLK/BCK generation.
+        self.pcr.i2s_tx_clkm_div_conf.set(0x0800_0000);
+        self.pcr.i2s_rx_clkm_div_conf.set(0x0800_0000);
+
         // Program BCK divider and bit width in CONF1.
         let bits_field = (bits as u32 - 1) & 0x1f;
         let hsb_field = (half_sample_bits - 1) & 0x3f;
 
+        // TDM_WS_WIDTH: WS pulse width in BCK periods (half-frame for Philips).
+        // TDM_CHAN_BITS: bits per TDM channel (same as data bits for standard I2S).
+        // BCK_NO_DLY: BCK not delayed in master mode (Philips standard).
+        let tdm_ws_width = (half_sample_bits - 1) & 0x7f;
+        let tdm_chan_bits = (bits as u32 - 1) & 0x1f;
+
         // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT (Philips).
         self.registers.tx_conf1.write(
-            Conf1::BCK_DIV_NUM.val(bck_div_field)
+            Conf1::TDM_WS_WIDTH.val(tdm_ws_width)
+                + Conf1::BCK_DIV_NUM.val(bck_div_field)
                 + Conf1::BITS_MOD.val(bits_field)
                 + Conf1::HALF_SAMPLE_BITS.val(hsb_field)
-                + Conf1::MSB_SHIFT.val(1),
+                + Conf1::TDM_CHAN_BITS.val(tdm_chan_bits)
+                + Conf1::MSB_SHIFT.val(1)
+                + Conf1::BCK_NO_DLY.val(1),
         );
 
         // RX_CONF1: same layout.
         self.registers.rx_conf1.write(
-            Conf1::BCK_DIV_NUM.val(bck_div_field)
+            Conf1::TDM_WS_WIDTH.val(tdm_ws_width)
+                + Conf1::BCK_DIV_NUM.val(bck_div_field)
                 + Conf1::BITS_MOD.val(bits_field)
                 + Conf1::HALF_SAMPLE_BITS.val(hsb_field)
-                + Conf1::MSB_SHIFT.val(1),
+                + Conf1::TDM_CHAN_BITS.val(tdm_chan_bits)
+                + Conf1::MSB_SHIFT.val(1)
+                + Conf1::BCK_NO_DLY.val(1),
         );
 
         Ok(())
     }
 
     /// Configure the TX (playback) path for the given format.
+    ///
+    /// Per TRM 30.9, this only writes the data-mode and channel-mode fields.
+    /// The actual TX/RX unit and FIFO reset happens in `configure()` after
+    /// `tx_update()`, not here.
     fn configure_tx(&self, cfg: &I2sConfig) {
-        // Reset TX.
-        self.registers.tx_conf.write(TxConf::TX_RESET::SET + TxConf::TX_FIFO_RESET::SET);
-        self.registers.tx_conf.set(0);
-
         // Build TX_CONF value.
-        let mut conf = TxConf::TX_PCM_BYPASS::SET + TxConf::TX_STOP_EN::SET;
+        // SIG_LOOPBACK: TX and RX share the same WS and BCK (loopback mode).
+        // TX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
+        // TX_MONO_FST_VLD: first channel data is valid in mono mode.
+        // TX_CHAN_MOD=0: two channels, both left and right active (stereo).
+        let mut conf = TxConf::TX_PCM_BYPASS::SET
+            + TxConf::TX_STOP_EN::SET
+            + TxConf::TX_TDM_EN::SET
+            + TxConf::TX_MONO_FST_VLD::SET
+            + TxConf::TX_CHAN_MOD.val(0)
+            + TxConf::SIG_LOOPBACK::SET;
         if matches!(cfg.channel_mode, I2sChannelMode::Mono) {
             conf += TxConf::TX_MONO::SET + TxConf::TX_CHAN_EQUAL::SET;
         }
-        // TDM and PDM are cleared (standard I2S only).
         self.registers.tx_conf.write(conf);
 
         // TDM_CTRL: enable channels 0 and 1, total = 2 channels for stereo.
@@ -307,12 +339,21 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     }
 
     /// Configure the RX (capture) path for the given format.
+    ///
+    /// Per TRM 30.9, this only writes the data-mode and channel-mode fields.
+    /// The actual TX/RX unit and FIFO reset happens in `configure()` after
+    /// `rx_update()`, not here.
     fn configure_rx(&self, cfg: &I2sConfig) {
-        // Reset RX.
-        self.registers.rx_conf.write(RxConf::RX_RESET::SET + RxConf::RX_FIFO_RESET::SET);
-        self.registers.rx_conf.set(0);
-
-        let mut conf = RxConf::RX_PCM_BYPASS::SET;
+        // RX_SLAVE_MOD: RX follows TX's clocks (loopback mode) so that RX
+        // uses the BCK/WS generated by TX instead of generating its own.
+        // RX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
+        // RX_MONO_FST_VLD: first channel data is valid in mono mode.
+        // RX_STOP_MODE=2: stop when RX_START=0 or RX FIFO is full.
+        let mut conf = RxConf::RX_PCM_BYPASS::SET
+            + RxConf::RX_SLAVE_MOD::SET
+            + RxConf::RX_TDM_EN::SET
+            + RxConf::RX_MONO_FST_VLD::SET
+            + RxConf::RX_STOP_MODE.val(2);
         if matches!(cfg.channel_mode, I2sChannelMode::Mono) {
             conf += RxConf::RX_MONO::SET;
         }
@@ -353,14 +394,102 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             core::hint::spin_loop();
         }
     }
+
+    /// Simultaneous TX/RX transfer for loopback testing.
+    ///
+    /// Starts RX DMA first, then TX DMA, so no incoming samples are lost.
+    /// Waits for both to complete. Used with GPIO-matrix loopback (DOUT and
+    /// DIN routed to the same pin) to verify the I2S data path.
+    pub fn loopback_transfer(
+        &self,
+        tx_buf: &[u8],
+        rx_buf: &mut [u8],
+    ) -> blueos_hal::err::Result<()> {
+        if tx_buf.is_empty() || rx_buf.is_empty() {
+            return Ok(());
+        }
+
+        log::info!(
+            "[I2S_TEST] loopback_transfer: tx={}, rx={}",
+            tx_buf.len(),
+            rx_buf.len()
+        );
+
+        // Re-configure I2S to ensure clocks and DMA bindings are correct.
+        log::info!("[I2S_TEST] re-configuring I2S...");
+        self.enable();
+        log::info!("[I2S] i2s_conf after enable: 0x{:08x}", self.pcr.i2s_conf.get());
+        self.configure(&I2sConfig::default_16k())?;
+        log::info!("[I2S_TEST] re-configure done");
+
+        // Prepare TX descriptor: single descriptor, suc_eof = true.
+        let tx_desc = unsafe { &mut *self.tx_desc.get() };
+        *tx_desc = DmaDescriptor::for_tx(tx_buf.as_ptr() as *mut u8, tx_buf.len(), true);
+
+        // Prepare RX descriptor.
+        let rx_desc = unsafe { &mut *self.rx_desc.get() };
+        *rx_desc = DmaDescriptor::for_rx(rx_buf.as_mut_ptr(), rx_buf.len());
+
+        log::info!(
+            "[I2S_TEST] tx_desc: dw0=0x{:08x}, buf={:p}",
+            tx_desc.dw0,
+            tx_desc.buffer
+        );
+        log::info!(
+            "[I2S_TEST] rx_desc: dw0=0x{:08x}, buf={:p}",
+            rx_desc.dw0,
+            rx_desc.buffer
+        );
+
+        // Start RX first so it is ready to capture when TX begins.
+        Esp32c6GdmaChannel::<RX_CH>::start_rx(rx_desc);
+        self.registers.rx_conf.modify(RxConf::RX_START::SET);
+        log::info!("[I2S_TEST] RX DMA started, RX_START set");
+
+        // Start TX.
+        Esp32c6GdmaChannel::<TX_CH>::start_tx(tx_desc);
+        self.registers.tx_conf.modify(TxConf::TX_START::SET);
+        log::info!("[I2S_TEST] TX DMA started, TX_START set");
+
+        // Dump I2S and DMA register state for debugging.
+        log::info!(
+            "[I2S_TEST] tx_conf=0x{:08x}, rx_conf=0x{:08x}",
+            self.registers.tx_conf.get(),
+            self.registers.rx_conf.get()
+        );
+        log::info!(
+            "[I2S_TEST] tx_conf1=0x{:08x}, rx_conf1=0x{:08x}",
+            self.registers.tx_conf1.get(),
+            self.registers.rx_conf1.get()
+        );
+        log::info!(
+            "[I2S_TEST] rxeof_num=0x{:08x}",
+            self.registers.rxeof_num.get()
+        );
+        Esp32c6GdmaChannel::<TX_CH>::dump_channel_state();
+        Esp32c6GdmaChannel::<RX_CH>::dump_channel_state();
+
+        // Wait for both to finish.
+        let tx_result = Esp32c6GdmaChannel::<TX_CH>::wait_tx_done();
+        log::info!("[I2S_TEST] wait_tx_done result: {:?}", tx_result);
+        let rx_result = Esp32c6GdmaChannel::<RX_CH>::wait_rx_done();
+        log::info!("[I2S_TEST] wait_rx_done result: {:?}", rx_result);
+
+        // Stop TX/RX so the next transfer can restart cleanly.
+        self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+        self.registers.rx_conf.modify(RxConf::RX_START::CLEAR);
+
+        tx_result?;
+        rx_result
+    }
 }
 
 impl<const TX_CH: usize, const RX_CH: usize> PlatPeri for Esp32c6I2s0<TX_CH, RX_CH> {
     fn enable(&self) {
         // 1. Enable I2S APB clock + high-pulse reset.
-        let conf_val = self.pcr.i2s_conf.get() | PcrI2sConf::I2S_CLK_EN.mask;
-        self.pcr.i2s_conf.set(conf_val | PcrI2sConf::I2S_RST_EN.mask);
-        self.pcr.i2s_conf.set(conf_val & !PcrI2sConf::I2S_RST_EN.mask);
+        self.pcr.i2s_conf.set(0);
+        self.pcr.i2s_conf.set(PcrI2sConf::I2S_CLK_EN.mask);
+        self.pcr.i2s_conf.set(PcrI2sConf::I2S_CLK_EN.mask | PcrI2sConf::I2S_RST_EN.mask);
 
         // 2. Reset the DMA channels and bind them to I2S0.
         Esp32c6GdmaChannel::<TX_CH>::reset_tx();
@@ -389,16 +518,27 @@ impl<const TX_CH: usize, const RX_CH: usize> Configuration<I2sConfig>
             I2sChannelMode::Mono => 1,
         };
 
-        // Clock tree first.
+        // 1. Clock tree first (TRM 30.9 — clock must be configured before reset).
         self.configure_clock(cfg.sample_rate, cfg.bits_per_sample, channels)?;
 
-        // TX/RX format.
+        // 2. TX/RX data mode + channel mode (TRM 30.9 step 4).
         self.configure_tx(cfg);
         self.configure_rx(cfg);
 
-        // Push register updates across the clock domain.
+        // 3. Push register updates across the clock domain (TRM 30.9 step 4).
         self.tx_update();
         self.rx_update();
+
+        // 4. Reset TX/RX units and FIFOs (TRM 30.7 / 30.9 step 5).
+        //    Module clock must already be configured (done in step 1).
+        self.registers.tx_conf
+            .modify(TxConf::TX_RESET::SET + TxConf::TX_FIFO_RESET::SET);
+        self.registers.tx_conf
+            .modify(TxConf::TX_RESET::CLEAR + TxConf::TX_FIFO_RESET::CLEAR);
+        self.registers.rx_conf
+            .modify(RxConf::RX_RESET::SET + RxConf::RX_FIFO_RESET::SET);
+        self.registers.rx_conf
+            .modify(RxConf::RX_RESET::CLEAR + RxConf::RX_FIFO_RESET::CLEAR);
 
         // Clear any pending I2S interrupts and disable them (we poll).
         self.registers.int_clr.write(I2sInt::TX_DONE.val(1) + I2sInt::RX_DONE.val(1));
@@ -406,6 +546,11 @@ impl<const TX_CH: usize, const RX_CH: usize> Configuration<I2sConfig>
 
         // FIFO hung timeout — keep the default (0x0810) to avoid stalls.
         self.registers.lc_hung_conf.set(0x0810);
+
+        // Ensure I2S module is not in reset state.
+        self.pcr.i2s_conf
+            .set(PcrI2sConf::I2S_CLK_EN.mask | PcrI2sConf::I2S_RST_EN.mask);
+        log::info!("[I2S] i2s_conf after configure: 0x{:08x}", self.pcr.i2s_conf.get());
 
         Ok(())
     }

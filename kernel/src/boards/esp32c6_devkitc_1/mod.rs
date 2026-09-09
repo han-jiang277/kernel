@@ -860,7 +860,9 @@ crate::define_pin_states!(
 
     // I2S0 pins for ES8311 audio codec (Waveshare ESP32-C6 Touch AMOLED 2.16).
     // MCLK output on GPIO19, BCLK output on GPIO20, WS output on GPIO22,
-    // DOUT (TX data) output on GPIO23, DIN (RX data) input on GPIO21.
+    // DOUT (TX data) output on GPIO23.
+    // For loopback testing, DOUT (I2SO_SD, signal 15) and DIN (I2SI_SD, signal 15)
+    // are both routed to GPIO23, so TX data loops back into RX via the GPIO matrix.
     #[cfg(i2s)]
     (
         blueos_kconfig::CONFIG_I2S_MCLK_GPIO as u8,
@@ -904,25 +906,12 @@ crate::define_pin_states!(
     (
         blueos_kconfig::CONFIG_I2S_DOUT_GPIO as u8,
         1,
-        false,
-        false,
-        false,
-        2,
-        Some(15),  // I2SO_SD output signal
-        None,
-        false,
-        false
-    ),
-    #[cfg(i2s)]
-    (
-        blueos_kconfig::CONFIG_I2S_DIN_GPIO as u8,
-        1,
-        true,
+        true,       // ie = true: input enable (loopback: DOUT pin also reads back as DIN)
         false,
         false,
         2,
-        None,
-        Some(15),  // I2SI_SD input signal
+        Some(15),   // I2SO_SD output signal (DOUT)
+        Some(15),   // I2SI_SD input signal  (DIN)  — same pin, GPIO-matrix loopback
         false,
         false
     ),
@@ -1125,6 +1114,17 @@ pub(crate) fn init_i2s() {
         kearly_println!("I2S0 audio device registered as /dev/i2s0");
     }
 
+    // Register the I2S loopback test device as /dev/i2s_test.
+    // Uses the same Esp32c6I2s0 driver; write() triggers a simultaneous
+    // TX/RX transfer with GPIO-matrix loopback (DOUT→DIN on the same pin).
+    let i2s_test = crate::devices::i2s_test::I2sTestDevice::new(i2s);
+    if let Err(e) = i2s_test.register("i2s_test") {
+        kearly_println!("Failed to register I2S test device: {:?}", e);
+        log::warn!("Failed to register I2S test device: {:?}", e);
+    } else {
+        kearly_println!("I2S test device registered as /dev/i2s_test");
+    }
+
     // Register the GDMA M2M self-test device as /dev/gdma_test.
     let gdma_test = crate::devices::gdma_test::GdmaTestDevice::new();
     if let Err(e) = gdma_test.register() {
@@ -1137,67 +1137,22 @@ pub(crate) fn init_i2s() {
     // Initialize the ES8311 codec via I2C0 (address 0x18).
     // This must happen after the I2C bus is up and the I2S clocks are running.
     if let Ok(i2c_bus) = init_i2c0_bus() {
-        if let Err(e) = init_es8311_codec(i2c_bus) {
+        let mut codec = crate::drivers::audio::es8311::Es8311Driver::new(i2c_bus);
+        if let Err(e) = codec.init() {
             kearly_println!("Failed to initialize ES8311 codec: {:?}", e);
             log::warn!("Failed to initialize ES8311 codec: {:?}", e);
         } else {
             kearly_println!("ES8311 codec initialized for playback");
+            if let Err(e) = codec.verify() {
+                kearly_println!("ES8311 codec verify failed: {:?}", e);
+                log::warn!("ES8311 codec verify failed: {:?}", e);
+            } else {
+                kearly_println!("ES8311 codec verified");
+            }
         }
     } else {
         kearly_println!("I2C0 bus not available — skipping ES8311 init");
     }
-}
-
-#[cfg(i2s)]
-fn init_es8311_codec(
-    bus: &alloc::sync::Arc<I2c0Bus>,
-) -> Result<(), blueos_hal::err::HalError> {
-    const ES8311_ADDR: u8 = 0x18;
-
-    // Helper: write one byte to an ES8311 register.
-    let write_reg = |reg: u8, val: u8| -> Result<(), blueos_hal::err::HalError> {
-        bus.intf.0.lock().write_bytes(ES8311_ADDR, &[reg, val], true, true)
-    };
-
-    // ES8311 init sequence for 16kHz/16-bit/I2S-Philips, MCLK=256×fs.
-    // Reset & power on.
-    write_reg(0x00, 0x1F)?; // reset
-    // Small delay to let the codec settle.
-    for _ in 0..100_000 {
-        core::hint::spin_loop();
-    }
-    write_reg(0x00, 0x00)?; // clear reset
-    write_reg(0x00, 0x80)?; // power on, slave serial port
-
-    // Clock source & enable (MCLK from MCLK pin, not inverted, all clocks on).
-    write_reg(0x01, 0x3F)?;
-
-    // Clock dividers for MCLK=4.096MHz (256×16kHz), fs=16kHz.
-    write_reg(0x02, 0x00)?; // pre_div=1, pre_multi=1x
-    write_reg(0x03, 0x10)?; // single speed, adc_osr=0x10
-    write_reg(0x04, 0x10)?; // dac_osr=0x10
-    write_reg(0x05, 0x00)?; // adc_div=1, dac_div=1
-    write_reg(0x06, 0x03)?; // bclk_div=4
-    write_reg(0x07, 0x00)?; // lrck_h=0
-    write_reg(0x08, 0xFF)?; // lrck_l=0xFF
-
-    // I2S format (16-bit, Philips).
-    write_reg(0x09, 0x0C)?; // DAC SDP: I2S, 16-bit
-    write_reg(0x0A, 0x0C)?; // ADC SDP: I2S, 16-bit
-
-    // Power up analog & DAC.
-    write_reg(0x0D, 0x01)?; // power up analog
-    write_reg(0x0E, 0x02)?; // enable analog PGA + ADC modulator
-    write_reg(0x12, 0x00)?; // power-up DAC
-    write_reg(0x13, 0x10)?; // enable HP output driver
-    write_reg(0x1C, 0x6A)?; // ADC EQ bypass, DC offset cancel
-    write_reg(0x37, 0x08)?; // DAC EQ bypass, fade off
-
-    // Unmute & set volume.
-    write_reg(0x31, 0x00)?; // unmute DAC
-    write_reg(0x32, 0xFF)?; // volume = max
-
-    Ok(())
 }
 
 #[cfg(not(i2s))]

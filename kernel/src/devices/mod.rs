@@ -39,6 +39,8 @@ pub mod gdma_test;
 pub mod gpio;
 #[cfg(i2s)]
 pub mod i2s;
+#[cfg(i2s)]
+pub mod i2s_test;
 pub mod i2c_core;
 #[cfg(enable_net)]
 pub(crate) mod net;
