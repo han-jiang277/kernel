@@ -101,6 +101,13 @@ const MIDELEG_USOFT_BIT: usize = 1 << 0;
 
 const MIDELEG_DELEG_MASK: usize = MIDELEG_USOFT_BIT | MIDELEG_UTIMER_BIT | MIDELEG_UEXT_BIT;
 
+#[cfg(esp32_internal_flash)]
+pub const LOADABLE_REGION_BASE: u32 = 0x0020_0000;
+#[cfg(esp32_internal_flash)]
+pub const LOADABLE_REGION_SIZE: u32 = 0x0030_0000;
+#[cfg(esp32_internal_flash)]
+pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
+
 const INTMTX_BASE: usize = 0x6001_0000;
 
 const INTMTX_USB_SERIAL_JTAG_MAP: usize = INTMTX_BASE + 0xC0;
@@ -674,6 +681,15 @@ pub(crate) fn init() {
         // Preserve other bits.
         let v = read32(PCR_MSPI_CLK_CONF);
         write32(PCR_MSPI_CLK_CONF, (v & !(0xFF << 8)) | (5 << 8));
+    }
+
+    #[cfg(esp32_internal_flash)]
+    {
+        if let Err(error) = crate::drivers::flash::init_internal_flash() {
+            log::warn!("Failed to init ESP32-C6 internal flash: {:?}", error);
+        } else if let Err(error) = crate::drivers::flash::init_esp32_flash_device() {
+            log::warn!("Failed to register ESP32-C6 flash device: {:?}", error);
+        }
     }
 
     unsafe {

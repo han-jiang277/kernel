@@ -21,8 +21,8 @@
 use crate::{
     devices::{Device, DeviceClass, DeviceId, DeviceManager},
     drivers::flash::{
-        flash_mmap::{self, DromMapping, ExecMapping, MapError},
-        internal_flash::{
+        flash_mmap_c3::{self, DromMapping, ExecMapping, MapError},
+        internal_flash_c3::{
             with_internal_flash, with_internal_flash_exclusive, EspFlashError,
             ESP_FLASH_SECTOR_SIZE,
         },
@@ -256,17 +256,18 @@ impl Esp32FlashDevice {
             .map_err(map_flash_err)?;
 
         self.begin_flash_operation()?;
-        let mapping = match with_internal_flash_exclusive(|| flash_mmap::map_exec(physical, size)) {
-            Ok(Ok(mapping)) => mapping,
-            Ok(Err(error)) => {
-                self.finish_flash_operation();
-                return Err(map_mmap_err(error));
-            }
-            Err(error) => {
-                self.finish_flash_operation();
-                return Err(map_flash_err(error));
-            }
-        };
+        let mapping =
+            match with_internal_flash_exclusive(|| flash_mmap_c3::map_exec(physical, size)) {
+                Ok(Ok(mapping)) => mapping,
+                Ok(Err(error)) => {
+                    self.finish_flash_operation();
+                    return Err(map_mmap_err(error));
+                }
+                Err(error) => {
+                    self.finish_flash_operation();
+                    return Err(map_flash_err(error));
+                }
+            };
 
         unsafe {
             let out = core::ptr::addr_of_mut!((*(arg as *mut MapExecRequest)).mapped_address);
@@ -307,7 +308,10 @@ impl Esp32FlashDevice {
         {
             let state = self.state.irqsave_lock();
             match &*state {
-                Esp32FlashState::Mapped { irom: _, drom: None } => {}
+                Esp32FlashState::Mapped {
+                    irom: _,
+                    drom: None,
+                } => {}
                 Esp32FlashState::Mapped { drom: Some(_), .. } => {
                     return Err(ErrorKind::PermissionDenied);
                 }
@@ -316,7 +320,7 @@ impl Esp32FlashDevice {
         }
 
         let mapping = match with_internal_flash_exclusive(|| {
-            flash_mmap::map_drom(physical, size, req.drom_vaddr)
+            flash_mmap_c3::map_drom(physical, size, req.drom_vaddr)
         }) {
             Ok(Ok(mapping)) => mapping,
             Ok(Err(error)) => return Err(map_mmap_err(error)),
@@ -359,7 +363,7 @@ impl Esp32FlashDevice {
         drop(state);
         // DROM first: it was mapped last and sits on its own entries.
         if let Some(dm) = &drom {
-            let r = with_internal_flash_exclusive(|| flash_mmap::unmap_drom(dm));
+            let r = with_internal_flash_exclusive(|| flash_mmap_c3::unmap_drom(dm));
             if let Ok(Err(error)) = r {
                 // Roll back: restore full Mapped state.
                 *self.state.irqsave_lock() = Esp32FlashState::Mapped { irom, drom };
@@ -370,7 +374,7 @@ impl Esp32FlashDevice {
                 return Err(map_flash_err(error));
             }
         }
-        let result = with_internal_flash_exclusive(|| flash_mmap::unmap_exec(&irom));
+        let result = with_internal_flash_exclusive(|| flash_mmap_c3::unmap_exec(&irom));
         match result {
             Ok(Ok(())) => {
                 self.finish_flash_operation();
@@ -378,17 +382,11 @@ impl Esp32FlashDevice {
             }
             Ok(Err(error)) => {
                 // I-bus unmap failed; DROM already gone. Restore I-bus-only Mapped.
-                *self.state.irqsave_lock() = Esp32FlashState::Mapped {
-                    irom,
-                    drom: None,
-                };
+                *self.state.irqsave_lock() = Esp32FlashState::Mapped { irom, drom: None };
                 Err(map_mmap_err(error))
             }
             Err(error) => {
-                *self.state.irqsave_lock() = Esp32FlashState::Mapped {
-                    irom,
-                    drom: None,
-                };
+                *self.state.irqsave_lock() = Esp32FlashState::Mapped { irom, drom: None };
                 Err(map_flash_err(error))
             }
         }
@@ -480,9 +478,9 @@ fn map_flash_err(e: EspFlashError) -> ErrorKind {
 
 fn map_mmap_err(e: MapError) -> ErrorKind {
     match e {
-        MapError::AlreadyMapped
-        | MapError::DromAlreadyMapped
-        | MapError::DromNotAfterExec => ErrorKind::PermissionDenied,
+        MapError::AlreadyMapped | MapError::DromAlreadyMapped | MapError::DromNotAfterExec => {
+            ErrorKind::PermissionDenied
+        }
         MapError::ZeroSize
         | MapError::OutOfRange
         | MapError::Overflow
