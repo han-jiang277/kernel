@@ -902,16 +902,31 @@ crate::define_pin_states!(
         false,
         false
     ),
+    // DOUT (TX data) output on GPIO23 — ES8311 DIN pin.
     #[cfg(i2s)]
     (
         blueos_kconfig::CONFIG_I2S_DOUT_GPIO as u8,
         1,
-        true,       // ie = true: input enable (loopback: DOUT pin also reads back as DIN)
+        false,
         false,
         false,
         2,
         Some(15),   // I2SO_SD output signal (DOUT)
-        Some(15),   // I2SI_SD input signal  (DIN)  — same pin, GPIO-matrix loopback
+        None,       // DOUT is output-only
+        false,
+        false
+    ),
+    // DIN (RX data) input on GPIO21 — ES8311 DOUT pin.
+    #[cfg(i2s)]
+    (
+        blueos_kconfig::CONFIG_I2S_DIN_GPIO as u8,
+        1,
+        true,       // ie = true: input enable
+        false,
+        false,
+        2,
+        None,       // DIN is input-only
+        Some(15),   // I2SI_SD input signal
         false,
         false
     ),
@@ -1106,6 +1121,17 @@ pub(crate) fn init_i2s() {
     // Initialize the I2S0 peripheral and register /dev/i2s0.
     let i2s = get_device!(i2s0);
     i2s.enable();
+    // Configure the I2S clock tree (MCLK/BCK/WS) before initializing the
+    // ES8311 codec. The codec's internal state machine needs MCLK running
+    // to latch its register settings correctly. This matches the reference
+    // ESP-IDF example which calls i2s_channel_enable() before es8311_open().
+    use blueos_hal::Configuration;
+    if let Err(e) = i2s.configure(&blueos_hal::i2s::I2sConfig::default_16k()) {
+        kearly_println!("Failed to configure I2S0 clocks: {:?}", e);
+        log::warn!("Failed to configure I2S0 clocks: {:?}", e);
+    } else {
+        kearly_println!("I2S0 clocks configured (MCLK/BCK/WS running)");
+    }
     let device = I2sDevice::new(i2s);
     if let Err(e) = device.register("i2s0") {
         kearly_println!("Failed to register I2S0 device: {:?}", e);
@@ -1115,15 +1141,15 @@ pub(crate) fn init_i2s() {
     }
 
     // Register the I2S loopback test device as /dev/i2s_test.
-    // Uses the same Esp32c6I2s0 driver; write() triggers a simultaneous
-    // TX/RX transfer with GPIO-matrix loopback (DOUT→DIN on the same pin).
-    let i2s_test = crate::devices::i2s_test::I2sTestDevice::new(i2s);
-    if let Err(e) = i2s_test.register("i2s_test") {
-        kearly_println!("Failed to register I2S test device: {:?}", e);
-        log::warn!("Failed to register I2S test device: {:?}", e);
-    } else {
-        kearly_println!("I2S test device registered as /dev/i2s_test");
-    }
+    // Disabled: the GPIO-matrix loopback (DOUT→DIN on the same pin) is not
+    // needed for audio playback and conflicts with the codec DIN pin.
+    // let i2s_test = crate::devices::i2s_test::I2sTestDevice::new(i2s);
+    // if let Err(e) = i2s_test.register("i2s_test") {
+    //     kearly_println!("Failed to register I2S test device: {:?}", e);
+    //     log::warn!("Failed to register I2S test device: {:?}", e);
+    // } else {
+    //     kearly_println!("I2S test device registered as /dev/i2s_test");
+    // }
 
     // Register the GDMA M2M self-test device as /dev/gdma_test.
     let gdma_test = crate::devices::gdma_test::GdmaTestDevice::new();
@@ -1137,7 +1163,25 @@ pub(crate) fn init_i2s() {
     // Initialize the ES8311 codec via I2C0 (address 0x18).
     // This must happen after the I2C bus is up and the I2S clocks are running.
     if let Ok(i2c_bus) = init_i2c0_bus() {
-        let mut codec = crate::drivers::audio::es8311::Es8311Driver::new(i2c_bus);
+        // PA control: the Waveshare ESP32-C6 Touch AMOLED 2.16 board config
+        // sets pa:-1 (no external PA), so we pass None here. To enable PA
+        // control, enable CONFIG_ES8311_PA and set CONFIG_ES8311_PA_GPIO.
+        #[cfg(es8311_pa)]
+        static ES8311_PA_PIN: blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin =
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+                blueos_kconfig::CONFIG_ES8311_PA_GPIO as u8,
+            );
+        #[cfg(es8311_pa)]
+        let pa_pin: Option<&'static blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin> =
+            Some(&ES8311_PA_PIN);
+        #[cfg(not(es8311_pa))]
+        let pa_pin: Option<&'static blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin> =
+            None;
+
+        let mut codec = crate::drivers::audio::es8311::Es8311Driver::<
+            blueos_driver::i2c::esp32_i2c::Esp32I2c,
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >::new(i2c_bus, pa_pin, false);
         if let Err(e) = codec.init() {
             kearly_println!("Failed to initialize ES8311 codec: {:?}", e);
             log::warn!("Failed to initialize ES8311 codec: {:?}", e);

@@ -73,6 +73,22 @@ config I2S_DIN_GPIO
     int "I2S DIN (RX data) GPIO"
     default 21
     range 0 30
+
+config ES8311_PA
+    bool "Enable ES8311 external PA control GPIO"
+    default n
+    help
+      Enable an external PA power-control GPIO for the ES8311 codec.
+      The Waveshare ESP32-C6 Touch AMOLED 2.16 board config sets
+      pa:-1 (no external PA), so this is disabled by default.
+
+config ES8311_PA_GPIO
+    int "ES8311 PA control GPIO"
+    default 26
+    range 0 30
+    depends on ES8311_PA
+    help
+      GPIO pin used to enable/disable the external PA.
 endif
 
 config CST9220
