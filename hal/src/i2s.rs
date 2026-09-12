@@ -90,4 +90,19 @@ pub trait I2s<P, T>: super::PlatPeri + super::Configuration<P, Target = T> {
     /// Read (capture) `buf.len()` bytes from the I2S RX path. Blocks until
     /// `buf` is filled.
     fn read(&self, buf: &mut [u8]) -> super::err::Result<()>;
+
+    /// Drain any in-flight TX data and stop the DMA engine.
+    ///
+    /// This is called when the device is closed (e.g. via `close()` syscall
+    /// triggered by `File::drop`). Implementations that use a continuously
+    /// running DMA ring must:
+    /// 1. Break the ring (set the last-written descriptor's `next` to null).
+    /// 2. Busy-poll until the DMA engine has consumed that descriptor.
+    /// 3. Stop the I2S TX path and halt the DMA.
+    ///
+    /// The default implementation does nothing (suitable for non-ring
+    /// drivers that already stop on their own).
+    fn drain_and_stop(&self) -> super::err::Result<()> {
+        Ok(())
+    }
 }

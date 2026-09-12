@@ -96,4 +96,13 @@ where
             .map(|()| buf.len())
             .map_err(|_| ErrorKind::Other)
     }
+
+    fn close(&self) -> Result<(), ErrorKind> {
+        // Drain any in-flight TX data and stop the DMA ring so that the
+        // last audio segment is fully played out before the device closes.
+        // This is triggered by the close() syscall when userspace drops the
+        // file (e.g. std::fs::File::drop → close(fd) → device.close()).
+        let _ = self.driver.drain_and_stop();
+        Ok(())
+    }
 }

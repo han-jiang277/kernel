@@ -270,7 +270,7 @@ register_structs! {
         (0x6c => _out_push),
         (0x70 => out_link: ReadWrite<u32, OutLink::Register>),
         (0x74 => out_state: ReadOnly<u32>),
-        (0x78 => _out_eof_des_addr),
+        (0x78 => out_eof_des_addr: ReadOnly<u32>),
         (0x7c => _out_eof_bfr_des_addr),
         (0x80 => _out_dscr),
         (0x84 => _out_dscr_bf0),
@@ -293,6 +293,7 @@ register_structs! {
 /// `buffer` is the data buffer address (word-aligned, internal SRAM).
 /// `next` is the next descriptor address, or null for end-of-list.
 #[repr(C, align(4))]
+#[derive(Clone, Copy)]
 pub struct DmaDescriptor {
     pub dw0: u32,
     pub buffer: *mut u8,
@@ -303,8 +304,8 @@ pub struct DmaDescriptor {
 const DW0_SIZE_MASK: u32 = 0xfff;
 const DW0_SIZE_SHIFT: u32 = 0;
 const DW0_LENGTH_SHIFT: u32 = 12;
-const DW0_SUC_EOF: u32 = 1 << 30;
-const DW0_OWNER_DMA: u32 = 1 << 31;
+pub const DW0_SUC_EOF: u32 = 1 << 30;
+pub const DW0_OWNER_DMA: u32 = 1 << 31;
 
 impl DmaDescriptor {
     /// Build a TX descriptor for `buf`. `suc_eof` marks the last descriptor so
@@ -354,12 +355,12 @@ fn in_int_regs<const CH: usize>() -> &'static IntCluster {
 
 /// Returns a `&'static IntCluster` for the TX (output) interrupt block of
 /// channel `CH`.
-fn out_int_regs<const CH: usize>() -> &'static IntCluster {
+pub fn out_int_regs<const CH: usize>() -> &'static IntCluster {
     let base = DMA_BASE + OUT_INT_BASE + CH * INT_STRIDE;
     unsafe { &*(base as *const IntCluster) }
 }
 
-fn wait_for_bit(regs: &IntCluster, mask: u32) -> bool {
+pub fn wait_for_bit(regs: &IntCluster, mask: u32) -> bool {
     for _ in 0..DMA_POLL_LIMIT {
         if regs.raw.get() & mask != 0 {
             return true;
@@ -492,17 +493,106 @@ impl<const CH: usize> Esp32c6GdmaChannel<CH> {
         int.clr.set(OutInt::OUT_DONE.val(1).value | OutInt::OUT_EOF.val(1).value | OutInt::OUT_TOTAL_EOF.val(1).value | OutInt::OUT_DSCR_ERR.val(1).value);
         // Ensure descriptor writes are visible to the DMA engine before start.
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        // Set the descriptor address and kick off — use modify() to preserve
-        // other fields. Do NOT set RESTART — it reuses the *previous* address.
         let ch = channel_regs::<CH>();
+        // OUT_EOF_MODE=1: OUT_EOF fires after the last data of a suc_eof=1
+        // descriptor is *taken from* the GDMA TX channel (pushed to the
+        // peripheral FIFO), guaranteeing the data has reached the I2S FIFO.
+        //ch.out_conf0.modify(OutConf0::OUT_EOF_MODE::SET);
         let desc_addr = (addr_of!(*desc) as usize as u32) & ((1 << 20) - 1);
         ch.out_link.modify(OutLink::OUTLINK_ADDR.val(desc_addr));
         ch.out_link.modify(OutLink::OUTLINK_START::SET);
     }
 
-    /// Returns `true` once the TX transfer has completed (`OUT_TOTAL_EOF`).
+    /// Start a TX transfer without resetting the TX FSM/FIFO.
+    ///
+    /// Identical to [`start_tx`] but skips [`reset_tx`], so the I2S FIFO is
+    /// preserved between consecutive transfers. This eliminates the audio gap
+    /// (FIFO underflow) that otherwise occurs on every `write()` call when
+    /// streaming chunked audio data.
+    pub fn start_tx_no_reset(desc: &DmaDescriptor) {
+        let int = out_int_regs::<CH>();
+        int.clr.set(OutInt::OUT_DONE.val(1).value | OutInt::OUT_EOF.val(1).value | OutInt::OUT_TOTAL_EOF.val(1).value | OutInt::OUT_DSCR_ERR.val(1).value);
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        let ch = channel_regs::<CH>();
+        ch.out_conf0.modify(OutConf0::OUT_EOF_MODE::SET + OutConf0::OUT_AUTO_WRBACK::SET);
+        let desc_addr = (addr_of!(*desc) as usize as u32) & ((1 << 20) - 1);
+        ch.out_link.modify(OutLink::OUTLINK_ADDR.val(desc_addr));
+        ch.out_link.modify(OutLink::OUTLINK_START::SET);
+    }
+
+    /// Returns `true` once the TX transfer has completed (`OUT_EOF` with
+    /// `OUT_EOF_MODE=1`, i.e. the last data of the `suc_eof=1` descriptor has
+    /// been pushed to the peripheral FIFO).
     pub fn is_tx_done() -> bool {
+        out_int_regs::<CH>().raw.get() & OutInt::OUT_EOF.mask != 0
+    }
+
+    /// Returns `true` if the `OUT_EOF` interrupt raw bit is set — i.e. a
+    /// descriptor with `suc_eof=1` has been consumed by the DMA engine.
+    pub fn is_out_eof() -> bool {
+        out_int_regs::<CH>().raw.get() & OutInt::OUT_EOF.mask != 0
+    }
+
+    /// Clear the `OUT_EOF` interrupt raw bit.
+    pub fn clear_out_eof() {
+        out_int_regs::<CH>().clr.set(OutInt::OUT_EOF.val(1).value);
+    }
+
+    /// Clear the `OUT_TOTAL_EOF` interrupt raw bit.
+    pub fn clear_out_total_eof() {
+        out_int_regs::<CH>()
+            .clr
+            .set(OutInt::OUT_TOTAL_EOF.val(1).value);
+    }
+
+    /// Returns `true` if the `OUT_TOTAL_EOF` interrupt raw bit is set — i.e.
+    /// the DMA engine has consumed the last descriptor of a terminated chain
+    /// (`next = null`) and come to a halt.
+    pub fn is_out_total_eof() -> bool {
         out_int_regs::<CH>().raw.get() & OutInt::OUT_TOTAL_EOF.mask != 0
+    }
+
+    /// Read the `OUT_EOF_DES_ADDR` register — the full 32-bit address of the
+    /// descriptor whose `suc_eof=1` data was most recently consumed by the
+    /// DMA engine. Combined with the base address of the descriptor array,
+    /// the caller can compute which descriptor index was just consumed.
+    pub fn read_out_eof_des_addr() -> u32 {
+        channel_regs::<CH>().out_eof_des_addr.get()
+    }
+
+    /// Restart the TX outlink after the DMA engine paused due to encountering
+    /// a descriptor with `owner=0`. The caller must have set `owner=1` on the
+    /// next descriptor before calling this.
+    pub fn restart_tx() {
+        let ch = channel_regs::<CH>();
+        ch.out_link.modify(OutLink::OUTLINK_RESTART::SET);
+    }
+
+    /// Read the current `OUT_CONF0` register value (for diagnostics).
+    pub fn read_out_conf0() -> u32 {
+        channel_regs::<CH>().out_conf0.get()
+    }
+
+    /// Read the current outlink descriptor address from `OUT_STATE` register.
+    ///
+    /// `OUT_STATE` bits[17:0] contain the address of the descriptor the DMA
+    /// engine is currently processing. By comparing this with the base address
+    /// of the descriptor array, the caller can compute which descriptor index
+    /// the DMA is currently on, and thus which descriptors are safe to refill.
+    pub fn read_outlink_dscr_addr() -> u32 {
+        channel_regs::<CH>().out_state.get() & 0x0003_ffff
+    }
+
+    /// Check if `OUT_DSCR_ERR` is set — descriptor error (e.g. invalid address).
+    pub fn is_out_dscr_err() -> bool {
+        out_int_regs::<CH>().raw.get() & OutInt::OUT_DSCR_ERR.mask != 0
+    }
+
+    /// Clear the `OUT_DSCR_ERR` interrupt raw bit.
+    pub fn clear_out_dscr_err() {
+        out_int_regs::<CH>()
+            .clr
+            .set(OutInt::OUT_DSCR_ERR.val(1).value);
     }
 
     /// Block until the TX transfer completes. Returns `Err` on timeout or

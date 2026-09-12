@@ -291,7 +291,7 @@ where
         //          Equivalent to C driver's set_mute(false) + set_vol(max).
         // ============================================================
         self.write_reg(0x31, 0x00)?; // unmute DAC
-        self.write_reg(0x32, 0x88)?; // volume = max
+        self.write_reg(0x32, 0xA0)?; // volume = max
 
         Ok(())
     }
@@ -306,7 +306,7 @@ where
             RegVal(0x09, 0x0C), // DAC SDP: I2S, 16-bit, unmuted
             RegVal(0x0A, 0x0C), // ADC SDP: I2S, 16-bit, unmuted
             RegVal(0x31, 0x00), // unmute DAC
-            RegVal(0x32, 0x88), // volume = max
+            RegVal(0x32, 0xA0), // volume = max
         ];
 
         for RegVal(reg, expected) in checks.iter() {

@@ -26,7 +26,10 @@ use blueos_hal::i2s::{I2s, I2sChannelMode, I2sConfig, I2sFormat};
 use blueos_hal::{Configuration, PlatPeri};
 use core::cell::UnsafeCell;
 
-use crate::dma::esp32c6_gdma::{DmaDescriptor, Esp32c6GdmaChannel, PERI_I2S0};
+use crate::dma::esp32c6_gdma::{
+    out_int_regs, wait_for_bit, DmaDescriptor, Esp32c6GdmaChannel, OutInt, PERI_I2S0, DW0_OWNER_DMA,
+    DW0_SUC_EOF,
+};
 use crate::static_ref::StaticRef;
 use tock_registers::{
     interfaces::{ReadWriteable, Readable, Writeable},
@@ -55,6 +58,21 @@ const fn gcd(a: u32, b: u32) -> u32 {
 
 /// Polling iteration cap for DMA wait.
 const POLL_LIMIT: u32 = 10_000_000;
+
+/// TX ring-buffer constants.
+///
+/// The TX path uses a ring of `RING_SIZE` descriptors, each pointing to a
+/// fixed `SEG`-byte buffer. The descriptor `next` pointers form a closed
+/// loop so the DMA engine never stops between segments — eliminating the
+/// audio gap (FIFO underflow) that occurs when DMA halts at chain end and
+/// must be restarted by the CPU.
+///
+/// `RING_SIZE` must be large enough that the CPU can fill segments ahead
+/// of DMA consumption without being blocked. With 16 descriptors × 4080
+/// bytes = ~65 KB ≈ 250 ms at 16 kHz, the CPU has a generous window to
+/// refill consumed segments while DMA is busy with later ones.
+const SEG: usize = 4080;
+const RING_SIZE: usize = 16;
 
 register_bitfields! [
     u32,
@@ -169,6 +187,7 @@ register_structs! {
         (0x70 => _etm_conf),
         (0x74 => _reserved3),
         (0x80 => date: ReadWrite<u32>),
+        //(0xEC => out_eof_bfr_des_addr: ReadOnly<u32, I2sInt::Register>),
         (0x84 => @END),
     }
 }
@@ -191,14 +210,34 @@ register_structs! {
 /// `TX_CH` and `RX_CH` are GDMA channel indices (0, 1, or 2). They must be
 /// distinct if both playback and capture are used simultaneously.
 ///
-/// The driver stores a TX descriptor and RX descriptor internally (single
-/// descriptor per transfer — callers feed buffers chunked to a reasonable
-/// size). The buffers themselves are supplied by the caller and must outlive
-/// the transfer.
+/// ## TX ring buffer
+///
+/// The TX path uses a ring of `RING_SIZE` DMA descriptors forming a closed
+/// loop (`desc[i].next = &desc[i+1]`, `desc[RING_SIZE-1].next = &desc[0]`).
+/// Each descriptor owns a fixed `SEG`-byte buffer. The DMA engine circulates
+/// indefinitely, so there is **zero inter-segment gap** — critical for
+/// glitch-free audio.
+///
+/// The CPU tracks a `write_idx` (next descriptor to fill). A descriptor is
+/// safe to refill once the DMA engine has consumed it — detected by polling
+/// the `owner` bit in `dw0[31]`: DMA clears it to 0 when done, CPU sets it
+/// back to 1 after refilling.
+///
+/// On `drain_and_stop()`, the ring is broken (last descriptor's `next` set
+/// to null) and the CPU waits for `OUT_TOTAL_EOF` before halting.
 pub struct Esp32c6I2s0<const TX_CH: usize, const RX_CH: usize> {
     registers: StaticRef<I2sRegisters>,
     pcr: StaticRef<PcrI2sRegisters>,
-    tx_desc: UnsafeCell<DmaDescriptor>,
+    /// Ring of DMA descriptors forming a closed loop.
+    tx_descs: UnsafeCell<[DmaDescriptor; RING_SIZE]>,
+    /// Per-descriptor buffers (each `SEG` bytes).
+    tx_bufs: UnsafeCell<[[u8; SEG]; RING_SIZE]>,
+    /// CPU write cursor: next descriptor index to fill.
+    write_idx: UnsafeCell<usize>,
+    /// Whether the DMA ring has been started.
+    tx_started: UnsafeCell<bool>,
+    /// Index of the last descriptor filled (for drain).
+    last_write_idx: UnsafeCell<Option<usize>>,
     rx_desc: UnsafeCell<DmaDescriptor>,
 }
 
@@ -212,11 +251,18 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         Self {
             registers: unsafe { StaticRef::new(I2S0_BASE as *const I2sRegisters) },
             pcr: unsafe { StaticRef::new(PCR_BASE as *const PcrI2sRegisters) },
-            tx_desc: UnsafeCell::new(DmaDescriptor {
-                dw0: 0,
-                buffer: core::ptr::null_mut(),
-                next: core::ptr::null_mut(),
+            tx_descs: UnsafeCell::new({
+                const NULL_DESC: DmaDescriptor = DmaDescriptor {
+                    dw0: 0,
+                    buffer: core::ptr::null_mut(),
+                    next: core::ptr::null_mut(),
+                };
+                [NULL_DESC; RING_SIZE]
             }),
+            tx_bufs: UnsafeCell::new([[0u8; SEG]; RING_SIZE]),
+            write_idx: UnsafeCell::new(0),
+            tx_started: UnsafeCell::new(false),
+            last_write_idx: UnsafeCell::new(None),
             rx_desc: UnsafeCell::new(DmaDescriptor {
                 dw0: 0,
                 buffer: core::ptr::null_mut(),
@@ -442,6 +488,59 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         }
     }
 
+    /// Busy-poll until descriptor `idx` is safe to refill.
+    ///
+    /// With `OUT_AUTO_WRBACK=1`, the DMA engine clears `dw0[31]` (owner bit)
+    /// to 0 after consuming a TX descriptor. We spin until that bit reads 0,
+    /// meaning the DMA has finished with this descriptor and its buffer is
+    /// safe to overwrite.
+    ///
+    /// Uses `read_volatile` on every iteration to bypass compiler caching.
+    fn wait_desc_safe(&self, idx: usize) {
+        let descs = unsafe { &*self.tx_descs.get() };
+        let desc_ptr = core::ptr::addr_of!(descs[idx].dw0) as *const u32;
+        let mut spin = 0u32;
+        loop {
+            let dw0 = unsafe { core::ptr::read_volatile(desc_ptr) };
+            if dw0 & DW0_OWNER_DMA == 0 {
+                return;
+            }
+            spin += 1;
+            if spin % 1_000_000 == 0 {
+                log::warn!(
+                    "[I2S] wait_desc_safe({}) still pending after {} spins, dw0=0x{:08x}",
+                    idx, spin, dw0,
+                );
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Check if the DMA engine is paused and restart it if so.
+    ///
+    /// With `OUT_AUTO_WRBACK=1`, the DMA pauses when it encounters a
+    /// descriptor whose owner bit is 0 (already consumed, not yet refilled).
+    /// We read `OUTLINK_DSCR_ADDR` from `OUT_STATE` to find the DMA's current
+    /// position, check that descriptor's owner bit, and if it's 0, issue
+    /// `OUTLINK_RESTART` to resume the DMA from that descriptor.
+    fn restart_if_paused(&self) {
+        let descs = unsafe { &*self.tx_descs.get() };
+        let base = (core::ptr::addr_of!(descs[0]) as usize) & 0x3_ffff;
+        let desc_size = core::mem::size_of::<DmaDescriptor>();
+        let dma_addr = Esp32c6GdmaChannel::<TX_CH>::read_outlink_dscr_addr() as usize;
+        if dma_addr < base {
+            return;
+        }
+        let dma_idx = (dma_addr - base) / desc_size;
+        if dma_idx >= RING_SIZE {
+            return;
+        }
+        let owner = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(descs[dma_idx].dw0) as *const u32) };
+        if owner & DW0_OWNER_DMA == 0 {
+            Esp32c6GdmaChannel::<TX_CH>::restart_tx();
+        }
+    }
+
     /// Simultaneous TX/RX transfer for loopback testing.
     ///
     /// Starts RX DMA first, then TX DMA, so no incoming samples are lost.
@@ -470,7 +569,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
         log::info!("[I2S_TEST] re-configure done");
 
         // Prepare TX descriptor: single descriptor, suc_eof = true.
-        let tx_desc = unsafe { &mut *self.tx_desc.get() };
+        let tx_desc = unsafe { &mut (*self.tx_descs.get())[0] };
         *tx_desc = DmaDescriptor::for_tx(tx_buf.as_ptr() as *mut u8, tx_buf.len(), true);
 
         // Prepare RX descriptor.
@@ -543,6 +642,13 @@ impl<const TX_CH: usize, const RX_CH: usize> PlatPeri for Esp32c6I2s0<TX_CH, RX_
         Esp32c6GdmaChannel::<TX_CH>::set_tx_peri(PERI_I2S0);
         Esp32c6GdmaChannel::<RX_CH>::reset_rx();
         Esp32c6GdmaChannel::<RX_CH>::set_rx_peri(PERI_I2S0);
+
+        // 3. Reset ring-buffer bookkeeping.
+        unsafe {
+            *self.write_idx.get() = 0;
+            *self.tx_started.get() = false;
+            *self.last_write_idx.get() = None;
+        }
     }
     fn disable(&self) {
         // Stop TX/RX.
@@ -611,21 +717,98 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
             return Ok(());
         }
 
-        // Prepare the TX descriptor: single descriptor, suc_eof = true.
-        let desc = unsafe { &mut *self.tx_desc.get() };
-        *desc = DmaDescriptor::for_tx(buf.as_ptr() as *mut u8, buf.len(), true);
+        let max_capacity = SEG * RING_SIZE;
+        if buf.len() > max_capacity {
+            return Err(blueos_hal::err::HalError::InvalidParam);
+        }
 
-        // Start DMA and I2S TX.
-        Esp32c6GdmaChannel::<TX_CH>::start_tx(desc);
-        self.registers.tx_conf.modify(TxConf::TX_START::SET);
+        let total_len = buf.len();
+        let num_segs = (total_len + SEG - 1) / SEG;
+        let descs = unsafe { &mut *self.tx_descs.get() };
+        let bufs = unsafe { &mut *self.tx_bufs.get() };
 
-        // Wait for the DMA to finish.
-        let result = Esp32c6GdmaChannel::<TX_CH>::wait_tx_done();
+        let started = unsafe { *self.tx_started.get() };
 
-        // Stop TX so the next write can restart cleanly.
-        self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+        if !started {
+            // First write: initialize the full ring.
+            // Fill desc[0..num_segs] with real audio data, desc[num_segs..RING_SIZE]
+            // with silence (zeros). All descriptors form a closed loop so the DMA
+            // engine circulates indefinitely. With OUT_AUTO_WRBACK=1, DMA clears
+            // the owner bit after consuming each descriptor, and pauses when it
+            // reaches an owner=0 descriptor (until CPU refills and restarts).
+            let mut widx = 0usize;
+            for i in 0..num_segs {
+                let off = i * SEG;
+                let len = SEG.min(total_len - off);
+                bufs[widx][..len].copy_from_slice(&buf[off..off + len]);
+                let next_idx = (widx + 1) % RING_SIZE;
+                descs[widx] = DmaDescriptor::for_tx(bufs[widx].as_mut_ptr(), len, true);
+                descs[widx].next = core::ptr::addr_of_mut!(descs[next_idx]);
+                widx = next_idx;
+            }
+            // Fill remaining slots with silence so DMA has valid data to play
+            // while CPU prepares the next write.
+            for i in num_segs..RING_SIZE {
+                bufs[i].fill(0);
+                let next_idx = (i + 1) % RING_SIZE;
+                descs[i] = DmaDescriptor::for_tx(bufs[i].as_mut_ptr(), SEG, true);
+                descs[i].next = core::ptr::addr_of_mut!(descs[next_idx]);
+            }
 
-        result
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            unsafe {
+                *self.write_idx.get() = 0;
+                *self.last_write_idx.get() = Some((num_segs - 1) % RING_SIZE);
+            }
+
+            // Start the DMA ring.
+            Esp32c6GdmaChannel::<TX_CH>::clear_out_eof();
+            Esp32c6GdmaChannel::<TX_CH>::clear_out_total_eof();
+            Esp32c6GdmaChannel::<TX_CH>::start_tx_no_reset(&descs[0]);
+            self.registers.tx_conf.modify(TxConf::TX_START::SET);
+            unsafe {
+                *self.tx_started.get() = true;
+            }
+            return Ok(());
+        }
+
+        // Subsequent writes: refill consumed descriptors one by one.
+        // With OUT_AUTO_WRBACK=1, DMA clears owner bit after consuming each
+        // descriptor, and pauses when it hits an owner=0 descriptor.
+        // We poll the owner bit, refill, set owner=1, then restart if paused.
+        let mut widx = unsafe { *self.write_idx.get() };
+        for i in 0..num_segs {
+            let off = i * SEG;
+            let len = SEG.min(total_len - off);
+
+            // Wait until DMA has consumed this descriptor (owner bit cleared).
+            self.wait_desc_safe(widx);
+
+            // Refill the buffer.
+            bufs[widx][..len].copy_from_slice(&buf[off..off + len]);
+
+            // Rebuild the descriptor: set size, length, suc_eof, and owner=DMA.
+            let size = (len as u32) & 0xfff;
+            let length = (len as u32) << 12;
+            descs[widx].dw0 = size | length | DW0_SUC_EOF | DW0_OWNER_DMA;
+            // next pointer is already correct (closed loop).
+
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+            widx = (widx + 1) % RING_SIZE;
+        }
+
+        // DMA may have paused on an owner=0 descriptor while we were refilling.
+        // Check and restart if needed.
+        self.restart_if_paused();
+
+        unsafe {
+            *self.write_idx.get() = widx;
+            *self.last_write_idx.get() = Some((widx + RING_SIZE - 1) % RING_SIZE);
+        }
+
+        Ok(())
     }
 
     fn read(&self, buf: &mut [u8]) -> blueos_hal::err::Result<()> {
@@ -644,5 +827,60 @@ impl<const TX_CH: usize, const RX_CH: usize> I2s<I2sConfig, ()>
         self.registers.rx_conf.modify(RxConf::RX_START::CLEAR);
 
         result
+    }
+
+    fn drain_and_stop(&self) -> blueos_hal::err::Result<()> {
+        // Only drain if the ring was actually started.
+        if !unsafe { *self.tx_started.get() } {
+            return Ok(());
+        }
+
+        let last_idx = match unsafe { *self.last_write_idx.get() } {
+            Some(idx) => idx,
+            None => return Ok(()),
+        };
+
+        let descs = unsafe { &mut *self.tx_descs.get() };
+
+        // Break the ring: the last-filled descriptor's `next` becomes null,
+        // so the DMA engine will halt after consuming it (OUT_TOTAL_EOF).
+        descs[last_idx].next = core::ptr::null_mut();
+        descs[last_idx].dw0 |= DW0_SUC_EOF; // ensure suc_eof=1
+
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+
+        // Busy-poll until DMA consumes the last descriptor and halts.
+        // OUT_TOTAL_EOF fires when DMA finishes a descriptor whose next=null.
+        loop {
+            if Esp32c6GdmaChannel::<TX_CH>::is_out_total_eof() {
+                break;
+            }
+            // Check for descriptor errors via the raw register.
+            let int = out_int_regs::<TX_CH>();
+            if !wait_for_bit(int, OutInt::OUT_TOTAL_EOF.mask | OutInt::OUT_DSCR_ERR.mask) {
+                log::warn!("[I2S] drain: TX timeout");
+                return Err(blueos_hal::err::HalError::Timeout);
+            }
+        }
+
+        // Stop I2S TX.
+        self.registers.tx_conf.modify(TxConf::TX_START::CLEAR);
+
+        // Clear interrupt flags.
+        Esp32c6GdmaChannel::<TX_CH>::clear_out_total_eof();
+        Esp32c6GdmaChannel::<TX_CH>::clear_out_eof();
+
+        // Restore the ring link for future playback.
+        let next_idx = (last_idx + 1) % RING_SIZE;
+        descs[last_idx].next = core::ptr::addr_of_mut!(descs[next_idx]);
+
+        // Reset ring bookkeeping.
+        unsafe {
+            *self.write_idx.get() = 0;
+            *self.tx_started.get() = false;
+            *self.last_write_idx.get() = None;
+        }
+
+        Ok(())
     }
 }
