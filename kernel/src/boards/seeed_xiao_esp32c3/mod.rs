@@ -237,6 +237,8 @@ crate::define_bus! {
                 orientation: mipidsi::options::Orientation::new()
                     .rotate(mipidsi::options::Rotation::Deg0)
                     .flip_horizontal(),
+                color_order: mipidsi::options::ColorOrder::Rgb,
+                invert_colors: mipidsi::options::ColorInversion::Inverted,
             }
         ),
         #[cfg(max7219)]

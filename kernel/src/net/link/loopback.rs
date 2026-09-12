@@ -128,4 +128,25 @@ impl SmoltcpDevice for LoopbackLink {
     fn poll_smoltcp(&mut self, timestamp: Instant, iface: &mut Interface, sockets: &mut SocketSet) {
         iface.poll(timestamp, &mut self.inner, sockets);
     }
+
+    fn poll_smoltcp_ingress_single(
+        &mut self,
+        timestamp: Instant,
+        iface: &mut Interface,
+        sockets: &mut SocketSet,
+    ) -> bool {
+        matches!(
+            iface.poll_ingress_single(timestamp, &mut self.inner, sockets),
+            smoltcp::iface::PollIngressSingleResult::None
+        )
+    }
+
+    fn poll_smoltcp_egress(
+        &mut self,
+        timestamp: Instant,
+        iface: &mut Interface,
+        sockets: &mut SocketSet,
+    ) {
+        iface.poll_egress(timestamp, &mut self.inner, sockets);
+    }
 }

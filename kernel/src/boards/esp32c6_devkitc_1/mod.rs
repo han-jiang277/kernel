@@ -20,6 +20,13 @@ use crate::{
 use blueos_driver::uart::esp32_usb_serial::Esp32UsbSerialIsr;
 use blueos_hal::{isr::IsrDesc, Has8bitDataReg};
 
+const LED_DEVICE_MAJOR: usize = 242;
+const LED_B_DEVICE_MINOR: usize = 0;
+const LED_R_DEVICE_MINOR: usize = 1;
+
+pub type Spi2Impl =
+    blueos_driver::spi::esp32c6_spi::Esp32c6Spi2<0x6008_1000, 0x6009_6000, 80_000_000>;
+
 pub type ClockImpl =
     blueos_driver::systimer::esp32_sys_timer::Esp32SysTimer<0x6000_a000, 16_000_000>;
 
@@ -239,124 +246,6 @@ const ETS_DELAY_US: usize = 0x4000_0040;
 unsafe fn ets_delay_us(us: u32) {
     let f: unsafe extern "C" fn(u32) = core::mem::transmute(ETS_DELAY_US);
     unsafe { f(us) };
-}
-
-/// Enable the ana I2C master clock + select target slave, return which I2C
-/// controller (0 or 1) to use for the transfer. Mirrors regi2c_enable_block()
-/// in patches/esp_rom_regi2c_esp32h2.c.
-#[inline]
-unsafe fn regi2c_enable_block(block: u8) -> u8 {
-    // Enable ana I2C master clock gate (MODEM_LPCON.clk_conf.bit2).
-    let v = read32(MODEM_LPCON_CLK_CONF_FOR_I2C);
-    write32(MODEM_LPCON_CLK_CONF_FOR_I2C, v | CLK_I2C_MST_EN_BIT);
-
-    // Pick the I2C controller based on CONF2 MST_SEL bit for this slave,
-    // and write CONF1 RD_MASK so only the target slave's read path is live.
-    // NOTE: esp-idf semantics (esp_rom_hp_regi2c_esp32c6.c:115) are inverted:
-    //   MST_SEL bit set   → use I2C0  (i2c_sel = 0)
-    //   MST_SEL bit clear → use I2C1  (i2c_sel = 1)
-    // CONF2 reset = 0x0004 (bit2 only), so BBPLL/DIG_REG MST_SEL bits reset to 0
-    // → default routes through I2C1. Earlier this was inverted, causing every
-    // regi2c read/write to hit the wrong controller and read back 0xff.
-    let (mst_sel_bit, rd_mask): (u32, u32) = match block {
-        REGI2C_BBPLL => (REGI2C_BBPLL_MST_SEL, REGI2C_BBPLL_RD_MASK),
-        REGI2C_DIG_REG => (REGI2C_DIG_REG_MST_SEL, REGI2C_DIG_REG_RD_MASK),
-        _ => (0, 0x00FF_FFFF),
-    };
-    let i2c_sel = if (read32(I2C_MST_ANA_CONF2) & mst_sel_bit) != 0 {
-        0
-    } else {
-        1
-    };
-    write32(I2C_MST_ANA_CONF1, rd_mask);
-    i2c_sel
-}
-
-/// Wait for the ana I2C controller to finish (BUSY=0). Bounded loop to avoid
-/// hanging the whole boot if the analog bus is wedged.
-#[inline]
-unsafe fn regi2c_wait_idle(ctrl_reg: usize) {
-    for _ in 0..100_000 {
-        if (read32(ctrl_reg) & REGI2C_RTC_BUSY) == 0 {
-            return;
-        }
-    }
-    // Timeout: ana I2C never went idle. Log and bail rather than hang.
-    kearly_println!(
-        "[bbpll] ana i2c busy timeout (ctrl=0x{:x})",
-        read32(ctrl_reg)
-    );
-}
-
-/// Read one 8-bit register from an ana I2C slave. Mirrors regi2c_read_impl().
-#[inline]
-unsafe fn regi2c_read(block: u8, reg_add: u8) -> u8 {
-    let i2c_sel = regi2c_enable_block(block);
-    let ctrl = if i2c_sel == 1 {
-        I2C_ANA_MST_I2C1_CTRL
-    } else {
-        I2C_ANA_MST_I2C0_CTRL
-    };
-    regi2c_wait_idle(ctrl);
-    // Read transaction: slave_id[7:0] | addr[15:8], WR_CNTL=0
-    let temp = ((block as u32) << REGI2C_RTC_SLAVE_ID_S) | ((reg_add as u32) << REGI2C_RTC_ADDR_S);
-    write32(ctrl, temp);
-    regi2c_wait_idle(ctrl);
-    // DATA field is bits[23:16] of the same CTRL reg after read completes
-    ((read32(ctrl) >> REGI2C_RTC_DATA_S) & 0xFF) as u8
-}
-
-/// Read-modify-write one bitfield on an ana I2C slave register.
-/// Mirrors regi2c_write_mask_impl(): read current byte, clear [msb:lsb],
-/// insert data, write back. data is masked to the field width.
-#[inline]
-unsafe fn regi2c_write_mask(block: u8, reg_add: u8, msb: u8, lsb: u8, data: u8) {
-    let i2c_sel = regi2c_enable_block(block);
-    let ctrl = if i2c_sel == 1 {
-        I2C_ANA_MST_I2C1_CTRL
-    } else {
-        I2C_ANA_MST_I2C0_CTRL
-    };
-    // Read current value
-    regi2c_wait_idle(ctrl);
-    let mut temp =
-        ((block as u32) << REGI2C_RTC_SLAVE_ID_S) | ((reg_add as u32) << REGI2C_RTC_ADDR_S);
-    write32(ctrl, temp);
-    regi2c_wait_idle(ctrl);
-    let cur: u32 = (read32(ctrl) >> REGI2C_RTC_DATA_S) & 0xFF;
-    // Build field mask [msb:lsb] with u32 arithmetic (u8 shift would panic
-    // in debug when field_width == 8). clear_mask zeroes the target field;
-    // then insert masked data into it.
-    let field_width = (msb - lsb + 1) as u32;
-    let field_one: u32 = (1u32 << field_width) - 1; // field_width 1-bits
-    let clear_mask: u32 = !(field_one << lsb as u32) & 0xFF;
-    let new_val: u32 = (cur & clear_mask) | (((data as u32) & field_one) << lsb as u32);
-    // Write back: slave_id | addr | WR_CNTL=1 | data
-    temp = ((block as u32) << REGI2C_RTC_SLAVE_ID_S)
-        | ((reg_add as u32) << REGI2C_RTC_ADDR_S)
-        | REGI2C_RTC_WR_CNTL
-        | (new_val << REGI2C_RTC_DATA_S);
-    write32(ctrl, temp);
-    regi2c_wait_idle(ctrl);
-}
-
-/// Write one full 8-bit register on an ana I2C slave (no RMW). Mirrors
-/// regi2c_write_impl(). Used for BBPLL OC_* config registers.
-#[inline]
-unsafe fn regi2c_write(block: u8, reg_add: u8, data: u8) {
-    let i2c_sel = regi2c_enable_block(block);
-    let ctrl = if i2c_sel == 1 {
-        I2C_ANA_MST_I2C1_CTRL
-    } else {
-        I2C_ANA_MST_I2C0_CTRL
-    };
-    regi2c_wait_idle(ctrl);
-    let temp = ((block as u32) << REGI2C_RTC_SLAVE_ID_S)
-        | ((reg_add as u32) << REGI2C_RTC_ADDR_S)
-        | REGI2C_RTC_WR_CNTL
-        | ((data as u32) << REGI2C_RTC_DATA_S);
-    write32(ctrl, temp);
-    regi2c_wait_idle(ctrl);
 }
 
 pub(crate) fn handle_intc_irq(ctx: &Context, mcause: usize, mtval: usize) {
@@ -597,9 +486,524 @@ pub(crate) fn init() {
 crate::define_peripheral! {
     (console_uart, blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial<0x6000_F000>,
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::<0x6000_F000>::new()),
+    (spi2, Spi2Impl, Spi2Impl::new()),
+    (i2c0, blueos_driver::i2c::esp32_i2c::Esp32I2c,
+     blueos_driver::i2c::esp32_i2c::Esp32I2c::new_c6(
+         0x6000_4000,
+         0x6009_6000,
+         40_000_000,
+     )),
+    (lcd_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8)),
+    (max7219_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_MAX7219_CS_GPIO as u8)),
+    (touch_rst, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_CST9220_RST_GPIO as u8)),
+    (st7796_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_ST7796_CS_GPIO as u8)),
+    (st7796_dc, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_ST7796_DC_GPIO as u8)),
+    (st7796_rst, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_ST7796_RST_GPIO as u8)),
+    (led_b, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(0)),
+    (led_r, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(1)),
 }
 
+crate::define_bus! {
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >,
+        #[cfg(co5300)]
+        (co5300, crate::drivers::lcd::co5300::Co5300Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            Co5300PanelSpec,
+        >,
+            crate::drivers::lcd::co5300::Co5300Config::new(
+                get_device!(lcd_cs),
+            )
+        ),
+        #[cfg(st7796)]
+        (st7796, crate::drivers::lcd::st7796::St7796Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >,
+            crate::drivers::lcd::st7796::St7796Config::<
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            > {
+                rst: get_device!(st7796_rst),
+                dc: get_device!(st7796_dc),
+                cs: Some(get_device!(st7796_cs)),
+                orientation: mipidsi::options::Orientation::new()
+                    .rotate(mipidsi::options::Rotation::Deg0),
+
+            }
+        ),
+        #[cfg(max7219)]
+        (max7219, crate::drivers::display::max7219::Max7219Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >,
+            crate::drivers::display::max7219::Max7219Config::<
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new(
+                get_device!(max7219_cs),
+                1,
+                1,
+            )
+        ),
+    ),
+    (i2c0_bus, crate::devices::i2c_core::block_i2c::BlockI2c<
+        blueos_driver::i2c::esp32_i2c::Esp32I2c,
+    >,
+        #[cfg(cst9220)]
+        (cst9220, crate::drivers::input::cst9220::Cst9220Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >,
+            crate::drivers::input::cst9220::Cst9220Config {
+                rst: get_device!(touch_rst),
+            }
+        ),
+        #[cfg(bme280)]
+        (bme280, crate::drivers::sensor::bme280::Bme280Config,
+            crate::drivers::sensor::bme280::Bme280Config::new(0x76)
+        ),
+    ),
+}
+
+#[cfg(any(co5300, cst9220, st7796, gpio, bme280, max7219))]
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_SCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(63),
+        None,
+        false,
+        false
+    ),
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO0_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(65),
+        None,
+        false,
+        false
+    ),
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO1_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(64),
+        None,
+        false,
+        false
+    ),
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO2_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(67),
+        None,
+        false,
+        false
+    ),
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO3_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(66),
+        None,
+        false,
+        false
+    ),
+    #[cfg(co5300)]
+    (
+        blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8,
+        1,
+        false,
+        true,
+        false,
+        2,
+        Some(128),
+        None,
+        true,
+        false
+    ),
+    // CST9220 uses the board's ESP32_SDA line.
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_SDA_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(46),
+        Some(46),
+        false,
+        true
+    ),
+    // CST9220 uses the board's ESP32_SCL line.
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_SCL_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(45),
+        Some(45),
+        false,
+        true
+    ),
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_INT_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        None,
+        None,
+        false,
+        false
+    ),
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_RST_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
+    // ST7796 SPI clock routed through the GPIO matrix (FSPICLK_OUT).
+    #[cfg(st7796)]
+    (
+        blueos_kconfig::CONFIG_ST7796_SCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(63),
+        None,
+        false,
+        false
+    ),
+    // ST7796 SPI MOSI routed through the GPIO matrix (FSPID_OUT).
+    #[cfg(st7796)]
+    (
+        blueos_kconfig::CONFIG_ST7796_MOSI_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(65),
+        None,
+        false,
+        false
+    ),
+    // ST7796 chip select driven by software GPIO output.
+    #[cfg(st7796)]
+    (
+        blueos_kconfig::CONFIG_ST7796_CS_GPIO as u8,
+        1,
+        false,
+        true,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
+    // ST7796 data/command line driven by software GPIO output.
+    #[cfg(st7796)]
+    (
+        blueos_kconfig::CONFIG_ST7796_DC_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
+    // ST7796 reset line driven by software GPIO output.
+    #[cfg(st7796)]
+    (
+        blueos_kconfig::CONFIG_ST7796_RST_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
+    // BME280 uses the board's ESP32_SDA line (I2CEXT0_SDA).
+    #[cfg(bme280)]
+    (
+        blueos_kconfig::CONFIG_BME280_SDA_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(46),
+        Some(46),
+        false,
+        true
+    ),
+    // BME280 uses the board's ESP32_SCL line (I2CEXT0_SCL).
+    #[cfg(bme280)]
+    (
+        blueos_kconfig::CONFIG_BME280_SCL_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(45),
+        Some(45),
+        false,
+        true
+    ),
+    // MAX7219 chip select driven by software GPIO output.
+    #[cfg(max7219)]
+    (
+        blueos_kconfig::CONFIG_MAX7219_CS_GPIO as u8,
+        1,
+        false,
+        true,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
+    #[cfg(gpio)]
+    (0, 1, false, true, false, 2, None, None, true, false), // led blue
+    #[cfg(gpio)]
+    (1, 1, false, true, false, 2, None, None, true, false), // led red
+);
+
+#[cfg(not(any(co5300, cst9220, st7796, gpio, bme280, max7219)))]
 crate::define_pin_states!(None);
+
+#[cfg(spi_core)]
+type Spi2Bus = crate::devices::bus::Bus<
+    crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >,
+>;
+
+#[cfg(spi_core)]
+static SPI2_BUS: spin::Once<alloc::sync::Arc<Spi2Bus>> = spin::Once::new();
+
+#[cfg(spi_core)]
+fn init_spi2_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Spi2Bus>> {
+    use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
+    use blueos_driver::spi::SpiConfig;
+
+    if let Some(bus) = SPI2_BUS.get() {
+        return Ok(bus);
+    }
+
+    let spi2 = get_device!(spi2);
+    let mut spi_config = SpiConfig::qspi_display_default();
+    #[cfg(max7219)]
+    {
+        // MAX7219 supports SPI mode 0 at up to 10 MHz, so cap the bus to
+        // the lowest maximum frequency required by an attached device.
+        spi_config.baudrate = 4_000_000;
+    }
+    let block = BlockSpi::new(spi2, get_device!(lcd_cs), &spi_config)
+        .map_err(|_| crate::error::code::EIO)?;
+    SPI2_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block)));
+    SPI2_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+#[cfg(spi_core)]
+pub(crate) fn init_spi_bus() {
+    use crate::drivers::InitDriver;
+
+    let bus = init_spi2_bus().expect("failed to initialize ESP32-C6 SPI2");
+    for device in crate::boards::get_bus_devices!(spi2_bus) {
+        bus.register_device(device)
+            .expect("failed to register ESP32-C6 SPI2 device");
+    }
+
+    #[cfg(co5300)]
+    if let Ok(driver) = bus.probe_driver(&crate::drivers::lcd::co5300::Co5300DriverModule::<
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        Co5300PanelSpec,
+    >::new())
+    {
+        if let Err(error) = driver.init(bus) {
+            kearly_println!("Failed to initialize CO5300 driver: {}", error);
+            log::warn!("Failed to initialize CO5300 driver: {}", error);
+        } else {
+            kearly_println!("CO5300 framebuffer registered");
+        }
+    }
+
+    #[cfg(st7796)]
+    if let Ok(driver) = bus.probe_driver(&crate::drivers::lcd::st7796::St7796DriverModule::<
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >::new())
+    {
+        if let Err(error) = driver.init(bus) {
+            kearly_println!("Failed to initialize ST7796 driver: {}", error);
+            log::warn!("Failed to initialize ST7796 driver: {}", error);
+        } else {
+            kearly_println!("ST7796 framebuffer registered");
+        }
+    }
+
+    #[cfg(max7219)]
+    if let Ok(driver) = bus.probe_driver(&crate::drivers::display::max7219::Max7219DriverModule::<
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >::new())
+    {
+        if let Err(error) = driver.init(bus) {
+            kearly_println!("Failed to initialize MAX7219 driver: {}", error);
+            log::warn!("Failed to initialize MAX7219 driver: {}", error);
+        } else {
+            kearly_println!("MAX7219 LED matrix registered as /dev/max7219");
+        }
+    } else {
+        kearly_println!("MAX7219 device description was not found on SPI2");
+        log::warn!("MAX7219 device description was not found on SPI2");
+    }
+}
+
+#[cfg(i2c_core)]
+type I2c0Bus = crate::devices::bus::Bus<
+    crate::devices::i2c_core::block_i2c::BlockI2c<blueos_driver::i2c::esp32_i2c::Esp32I2c>,
+>;
+
+#[cfg(i2c_core)]
+static I2C0_BUS: spin::Once<alloc::sync::Arc<I2c0Bus>> = spin::Once::new();
+
+#[cfg(i2c_core)]
+fn init_i2c0_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<I2c0Bus>> {
+    use crate::devices::{bus::Bus, i2c_core::block_i2c::BlockI2c};
+
+    if let Some(bus) = I2C0_BUS.get() {
+        return Ok(bus);
+    }
+
+    let block = BlockI2c::new(get_device!(i2c0)).map_err(|_| crate::error::code::EIO)?;
+    I2C0_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block)));
+    I2C0_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+pub(crate) fn init_i2c_bus() {
+    #[cfg(any(cst9220, bme280))]
+    {
+        use crate::drivers::InitDriver;
+
+        let bus = init_i2c0_bus().expect("failed to initialize ESP32-C6 I2C0");
+        for device in crate::boards::get_bus_devices!(i2c0_bus) {
+            bus.register_device(device)
+                .expect("failed to register ESP32-C6 I2C0 device");
+        }
+
+        #[cfg(cst9220)]
+        if let Ok(driver) =
+            bus.probe_driver(&crate::drivers::input::cst9220::Cst9220DriverModule::<
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new())
+        {
+            if let Err(error) = driver.init(bus) {
+                kearly_println!("Failed to initialize CST9220 driver: {}", error);
+                log::warn!("Failed to initialize CST9220 driver: {}", error);
+            } else {
+                kearly_println!("CST9220 touch device registered as /dev/cst9220");
+            }
+        } else {
+            kearly_println!("CST9220 device description was not found on I2C0");
+            log::warn!("CST9220 device description was not found on I2C0");
+        }
+
+        #[cfg(bme280)]
+        if let Ok(driver) = bus.probe_driver(&crate::drivers::sensor::bme280::Bme280DriverModule) {
+            if let Err(error) = driver.init(bus) {
+                kearly_println!("Failed to initialize BME280 driver: {}", error);
+                log::warn!("Failed to initialize BME280 driver: {}", error);
+            } else {
+                kearly_println!("BME280 sensor registered as /dev/bme2800");
+            }
+        } else {
+            kearly_println!("BME280 device description was not found on I2C0");
+            log::warn!("BME280 device description was not found on I2C0");
+        }
+    }
+}
+pub(crate) fn init_gpio() {
+    crate::devices::gpio::GeneralGpio::new(
+        get_device!(led_b),
+        Some(crate::devices::gpio::Level::High),
+    )
+    .register(
+        alloc::string::String::from("led_b"),
+        crate::devices::DeviceId::new(LED_DEVICE_MAJOR, LED_B_DEVICE_MINOR),
+    )
+    .expect("Failed to register led_b");
+    crate::devices::gpio::GeneralGpio::new(
+        get_device!(led_r),
+        Some(crate::devices::gpio::Level::High),
+    )
+    .register(
+        alloc::string::String::from("led_r"),
+        crate::devices::DeviceId::new(LED_DEVICE_MAJOR, LED_R_DEVICE_MINOR),
+    )
+    .expect("Failed to register led_r");
+}
 
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}

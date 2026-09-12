@@ -192,7 +192,7 @@ impl NetworkManager {
 
                 // Warning!!! Need to yield or sleep for a while , or other threads may have no chance to insert msg to NETSTACK_QUEUE
                 if sleep_time == 0 {
-                    scheduler::suspend_me_for::<()>(Tick(1), None);
+                    scheduler::suspend_me_for::<()>(Tick::from_millis(1), None);
                 } else {
                     scheduler::suspend_me_for::<()>(
                         Tick::from_millis(sleep_time.min(DEFAULT_DELAY_TIME_IN_MILLIS) as u64),

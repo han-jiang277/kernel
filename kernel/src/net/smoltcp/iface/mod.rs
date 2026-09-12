@@ -146,20 +146,37 @@ impl NetIface {
     ///
     /// Dispatches to `SmoltcpDevice::poll_smoltcp()` which uses the concrete
     /// device type internally, keeping the L2 `LinkLayer` trait smoltcp-free.
+    ///
+    /// The `link.write()` lock is held only for the duration of a single
+    /// ingress/egress cycle. Between ingress iterations the lock is dropped so
+    /// that the Wi-Fi libnet80211 task can run and deliver beacon frames,
+    /// preventing StationBeaconTimeout under CPU contention.
     pub fn poll(&self, timestamp: Instant) {
+        // Drain up to INGRESS_BUDGET frames. Both `smoltcp` (spin::Mutex) and
+        // `link` (spin::RwLock) are acquired and released on every iteration so
+        // that other threads — UI, libnet80211 beacon handler — can make progress
+        // between frames instead of spinning for the entire poll cycle.
+        const INGRESS_BUDGET: usize = 8;
+        for _ in 0..INGRESS_BUDGET {
+            let done = {
+                let mut state = self.smoltcp.lock();
+                let SmoltcpState { iface, sockets } = &mut *state;
+                if let (Some(iface), Some(sockets)) = (iface.as_mut(), sockets.as_mut()) {
+                    let mut link = self.link.write();
+                    link.poll_smoltcp_ingress_single(timestamp, iface, sockets)
+                } else {
+                    true
+                }
+            }; // smoltcp.lock() and link.write() both released here
+            if done {
+                break;
+            }
+        }
+        // Egress pass: acquire both locks once for the full egress flush.
         let mut state = self.smoltcp.lock();
         let SmoltcpState { iface, sockets } = &mut *state;
         if let (Some(iface), Some(sockets)) = (iface.as_mut(), sockets.as_mut()) {
-            let mut smoltcp = self.link.write();
-            smoltcp.poll_smoltcp_budgeted(timestamp, iface, sockets, 2);
-
-            // Phase 1 marker: native RX path placeholder.
-            // In Phase 2, after poll(), we will:
-            //   1. Read raw L2 frame from the link device
-            //   2. Parse L2 header (Ethernet or IP)
-            //   3. Create PacketMeta { iface_index, ip_proto }
-            //   4. Wrap payload in Packet { meta, buffer, data_start, data_len }
-            //   5. Dispatch via PROTOCOL_REGISTRY.get_by_proto(ip_proto)
+            self.link.write().poll_smoltcp_egress(timestamp, iface, sockets);
         }
     }
 

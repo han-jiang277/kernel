@@ -537,9 +537,6 @@ impl Device for Esp32WlanLink {
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.mtu();
-        // Keep egress bursts bounded so the Wi-Fi task gets regular scheduling
-        // opportunities to service beacon reception.
-        caps.max_burst_size = Some(1);
         caps.medium = SmoltcpMedium::Ethernet;
         caps
     }
@@ -606,6 +603,27 @@ impl SmoltcpDevice for Esp32WlanLink {
 
     fn has_pending_rx(&self) -> bool {
         self.controller.has_pending_rx()
+    }
+
+    fn poll_smoltcp_ingress_single(
+        &mut self,
+        timestamp: Instant,
+        iface: &mut Interface,
+        sockets: &mut SocketSet,
+    ) -> bool {
+        matches!(
+            iface.poll_ingress_single(timestamp, self, sockets),
+            smoltcp::iface::PollIngressSingleResult::None
+        )
+    }
+
+    fn poll_smoltcp_egress(
+        &mut self,
+        timestamp: Instant,
+        iface: &mut Interface,
+        sockets: &mut SocketSet,
+    ) {
+        iface.poll_egress(timestamp, self, sockets);
     }
 }
 
@@ -894,7 +912,8 @@ fn esp_api_adapter_init() -> Result<(), NetError> {
                     rssi,
                 } => log::warn!("WiFi BSS RSSI low: rssi={} dBm", rssi),
                 EventInfo::StationBeaconTimeout => {
-                    log::warn!("WiFi StationBeaconTimeout");
+                    log::warn!("WiFi StationBeaconTimeout — reconnecting");
+                    let _ = unsafe { esp_wifi_connect_internal() };
                 }
                 EventInfo::StationAuthenticationModeChange { old_mode, new_mode } => {
                     log::warn!(

@@ -39,6 +39,7 @@ use core::{
     time::Duration,
 };
 use spin::Mutex;
+use crate::sync::SpinLock;
 
 // For posix syscalls
 pub type ConnectionResult = Result<usize, ConnectionError>;
@@ -926,7 +927,7 @@ const STATE_WAITING_FOR_CONSUME: usize = 1;
 const STATE_AFTER_CONSUME: usize = 2;
 
 pub struct OperationIPCReply {
-    reply_result: Mutex<Option<OperationResult>>,
+    reply_result: crate::sync::SpinLock<Option<OperationResult>>,
     reply_futex: AtomicUsize,
     cancelled: AtomicBool,
 }
@@ -934,7 +935,7 @@ pub struct OperationIPCReply {
 impl OperationIPCReply {
     pub fn new() -> Self {
         Self {
-            reply_result: Mutex::new(None),
+            reply_result: crate::sync::SpinLock::new(None),
             reply_futex: AtomicUsize::new(STATE_IDLE),
             cancelled: AtomicBool::new(false),
         }
@@ -972,7 +973,7 @@ impl OperationIPCReply {
         );
 
         loop {
-            if let Some(result) = self.reply_result.lock().take() {
+            if let Some(result) = self.reply_result.irqsave_lock().take() {
                 self.reply_futex.store(STATE_IDLE, Ordering::Release);
                 return result.map_err(Into::into);
             }
@@ -1021,7 +1022,7 @@ impl OperationIPCReply {
         if self.cancelled.load(Ordering::Acquire) {
             return;
         }
-        self.reply_result.lock().replace(result);
+        self.reply_result.irqsave_lock().replace(result);
 
         // State
         self.reply_futex

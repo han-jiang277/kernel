@@ -17,12 +17,12 @@ use crate::{
 };
 use alloc::boxed::Box;
 use blueos_driver::interrupt_controller::Interrupt;
-use esp_hal::ram;
 use core::{
     ffi::CStr,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
+use esp_hal::ram;
 use esp_radio_rtos_driver::{
     queue::{QueueHandle, QueuePtr},
     semaphore::{SemaphoreHandle, SemaphoreKind, SemaphorePtr},
@@ -168,9 +168,8 @@ pub static ISR_INTERRUPT_1: Handler = Handler::new();
 pub fn dispatch_handler(handler: &Handler) {
     let f = handler.f.load(Ordering::Acquire);
     if !f.is_null() {
-        let func = unsafe {
-            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut c_void)>(f)
-        };
+        let func =
+            unsafe { core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut c_void)>(f) };
         let arg = handler.arg.load(Ordering::Relaxed);
         unsafe { func(arg) };
     }
@@ -247,13 +246,6 @@ pub unsafe extern "C" fn set_intr(cpu_no: i32, intr_source: u32, intr_num: u32, 
         // 4) PLIC_MX_ENABLE: enable this line.
         let en = core::ptr::read_volatile(PLIC_MX_ENABLE as *const u32);
         core::ptr::write_volatile(PLIC_MX_ENABLE as *mut u32, en | (1u32 << line));
-        // Restore mie and set the enable bit for this line + the standard MEIE (bit11)
-        // aggregate master gate. esp-hal does `csrw mie, u32::MAX` in _setup_interrupts
-        // (esp-hal-1.1.1 src/interrupt/riscv.rs:554), enabling both MEIE and per-line
-        // bits. If C6's mie aggregates external interrupts via MEIP, setting only the
-        // per-line bit without MEIE would prevent the interrupt from reaching the trap.
-        // [BISECT-ROUND2] MEIE (bit11) temporarily dropped to test whether it
-        // is the WiFi-interrupt root cause. Restore `| (1usize << 11)` after.
         mie |= 1usize << line;
         core::arch::asm!("fence io, io", options(nostack, preserves_flags));
         core::arch::asm!(
@@ -278,15 +270,6 @@ pub unsafe extern "C" fn set_intr(cpu_no: i32, intr_source: u32, intr_num: u32, 
 pub unsafe extern "C" fn clear_intr(intr_source: u32, intr_num: u32) {}
 
 pub unsafe extern "C" fn set_isr(n: i32, f: *mut c_void, arg: *mut c_void) {
-    // [diag] Confirm whether libnet80211 calls this callback + the mie value at call time
-    // (check whether the WiFi line1 enable bit is already set).
-    // let mie_before: usize;
-    // core::arch::asm!(
-    //     "csrr {mie}, mie",
-    //     mie = out(reg) mie_before,
-    //     options(nostack, preserves_flags),
-    // );
-    // log::info!("[diag] set_isr(n={n}, f={f:p}, arg={arg:p}) mie_before=0x{mie_before:x}");
     match n {
         0 | 1 => ISR_INTERRUPT_1.set(f, arg),
         _ => panic!("set_isr - unsupported interrupt number {}", n),
@@ -327,17 +310,6 @@ pub unsafe extern "C" fn ints_on(mask: u32) {
     const INT_ENABLE_REG: usize = 0x600C2104;
     #[cfg(soc_esp32c6)]
     const INT_ENABLE_REG: usize = 0x20001000;
-    // [diag] Confirm the CPU interrupt bit mask the driver enables + mie before the call.
-    // mask = 1 << cpu_intr_num; WiFi expects mask=0x2 (line1); if not 0x2, the driver
-    // routed WiFi to a line other than line1, which does not match set_isr's
-    // ISR_INTERRUPT_1 (line1) → never reaches the trap.
-    // let mie_before: usize;
-    // core::arch::asm!(
-    //     "csrr {mie}, mie",
-    //     mie = out(reg) mie_before,
-    //     options(nostack, preserves_flags),
-    // );
-    // log::info!("[diag] ints_on(mask=0x{mask:x}) mie_before=0x{mie_before:x}");
     let tmp = core::ptr::read_volatile(INT_ENABLE_REG as *const u32);
     core::ptr::write_volatile(INT_ENABLE_REG as *mut u32, tmp | mask);
 }

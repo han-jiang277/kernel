@@ -62,6 +62,29 @@ pub trait SmoltcpDevice: LinkLayer + 'static {
     fn has_pending_rx(&self) -> bool {
         false
     }
+
+    /// Poll a single ingress frame. Returns `true` if the queue is empty
+    /// (no more frames to process), `false` if more frames may be waiting.
+    ///
+    /// The default implementation delegates to `poll_smoltcp` and always
+    /// returns `true` (signals done) so non-Wi-Fi devices are unaffected.
+    fn poll_smoltcp_ingress_single(
+        &mut self,
+        timestamp: smoltcp::time::Instant,
+        iface: &mut smoltcp::iface::Interface,
+        sockets: &mut smoltcp::iface::SocketSet,
+    ) -> bool {
+        self.poll_smoltcp(timestamp, iface, sockets);
+        true
+    }
+
+    /// Flush all pending egress frames using this device's concrete Device impl.
+    fn poll_smoltcp_egress(
+        &mut self,
+        timestamp: smoltcp::time::Instant,
+        iface: &mut smoltcp::iface::Interface,
+        sockets: &mut smoltcp::iface::SocketSet,
+    );
 }
 
 impl dyn SmoltcpDevice {

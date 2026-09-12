@@ -55,7 +55,7 @@ pub struct EspAppDesc {
 }
 
 #[unsafe(export_name = "esp_app_desc")]
-#[unsafe(link_section = ".rodata_desc.appdesc")]
+#[unsafe(link_section = ".flash.appdesc")]
 /// Application metadata descriptor.
 /// FIXME: This is currently hardcoded, but we should generate it from build scripts.
 pub static ESP_APP_DESC: EspAppDesc = EspAppDesc {

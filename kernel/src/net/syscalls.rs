@@ -30,7 +30,7 @@ use core::{
     sync::atomic::{AtomicI32, Ordering},
     time::Duration,
 };
-use libc::{size_t, timeval};
+use libc::size_t;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 use spin::rwlock::RwLock;
 

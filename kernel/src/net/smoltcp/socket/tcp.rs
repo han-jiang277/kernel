@@ -304,7 +304,7 @@ impl PosixSocket for TcpSocket {
                             is_shutdown,
                         );
                         socket.register_send_waker(&waker);
-                        log::debug!(
+                        log::trace!(
                             "tcp socket not ready for send={:?}, send_queue={:?}",
                             socket.state(),
                             socket.send_queue()
@@ -313,6 +313,21 @@ impl PosixSocket for TcpSocket {
                     } else {
                         Err(SocketError::TryAgain)
                     }
+                }
+                State::FinWait1
+                | State::FinWait2
+                | State::Closing
+                | State::TimeWait
+                | State::LastAck
+                | State::Closed => {
+                    log::trace!(
+                        "TCP state[{}]: connection closing/closed, send returns EPIPE",
+                        socket.state()
+                    );
+                    Err(SocketError::PosixError(
+                        -libc::EPIPE,
+                        "connection closing or closed".into(),
+                    ))
                 }
                 _ => {
                     let msg = format!("Invalid TCP state[{}] to send", socket.state());
@@ -367,12 +382,17 @@ impl PosixSocket for TcpSocket {
             }
 
             match socket.state() {
-                State::Closed | State::CloseWait => {
-                    let msg = format!(
-                        "TCP state[{}]: closed by server, returning 0 to indicate EOF",
+                State::Closed
+                | State::CloseWait
+                | State::FinWait1
+                | State::FinWait2
+                | State::Closing
+                | State::TimeWait
+                | State::LastAck => {
+                    log::trace!(
+                        "TCP state[{}]: connection closing/closed, returning 0 (EOF)",
                         socket.state()
                     );
-                    log::debug!("{}", msg);
                     Ok(0)
                 }
                 State::SynSent | State::SynReceived | State::Established => {
@@ -393,7 +413,7 @@ impl PosixSocket for TcpSocket {
                             is_shutdown,
                         );
                         socket.register_recv_waker(&recv_waker);
-                        log::debug!(
+                        log::trace!(
                             "TCP state[{:?}]: no data for recv, recv_queue={:?}",
                             socket.state(),
                             socket.recv_queue()
@@ -402,7 +422,6 @@ impl PosixSocket for TcpSocket {
                     }
                 }
                 _ => {
-                    // States like FinWait1, FinWait2, or LastAck are unexpected for recv() here
                     let msg = format!("TCP state[{}]: invalid state for recv()", socket.state());
                     log::debug!("{}", msg);
                     Err(SocketError::InvalidState(msg))
@@ -443,13 +462,15 @@ impl PosixSocket for TcpSocket {
                 let handle = self
                     .smoltcp_socket_handle
                     .ok_or(SocketError::InvalidHandle)?;
-                // Close the socket first
+                // Initiate TCP close (sends FIN). Do NOT remove the socket from the
+                // SocketSet here — smoltcp must continue processing ACK/FIN packets
+                // for the handshake to complete. The socket is removed in Drop once
+                // the Rust object is destroyed, after the poll loop has had time to
+                // drain the remaining TCP state.
                 let _ = iface.with_socket::<tcp::Socket<'static>, _, i32>(handle, |socket, _| {
                     socket.close();
                     Ok(0i32)
                 });
-                // Remove from socket set
-                iface.remove_socket(handle);
                 Ok(0)
             }
             None => Err(SocketError::InterfaceNoAvailable),
@@ -513,5 +534,21 @@ impl PosixSocket for TcpSocket {
 
     fn is_shutdown(&self) -> bool {
         self.is_shutdown.get()
+    }
+}
+
+impl Drop for TcpSocket {
+    fn drop(&mut self) {
+        // Remove the smoltcp socket from the SocketSet on drop.
+        // shutdown() intentionally does NOT call remove_socket so that smoltcp
+        // can complete the TCP FIN/ACK handshake during subsequent poll cycles.
+        // By the time Drop runs, enough poll iterations have occurred for the
+        // handshake to finish (the caller destroys TcpSocket only after the
+        // application has closed the connection and moved on).
+        if let (Some(iface), Some(handle)) =
+            (&self.smoltcp_interface, self.smoltcp_socket_handle)
+        {
+            iface.remove_socket(handle);
+        }
     }
 }

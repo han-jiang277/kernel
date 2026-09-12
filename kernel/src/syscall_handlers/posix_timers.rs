@@ -261,11 +261,13 @@ pub(crate) fn clock_nanosleep(
     if flags & !supported_flags != 0 {
         return -EINVAL as c_long;
     }
-    let request = unsafe { &*rqtp };
+    // nanosleep may pass the same object for rqtp and rmtp. Copy the request
+    // before writing the remaining-time result.
+    let request = unsafe { core::ptr::read_unaligned(rqtp) };
     let remaining_ns = if (flags & TIMER_ABSTIME) != 0 {
-        remaining_ns_for_absolute(clock_id, request)
+        remaining_ns_for_absolute(clock_id, &request)
     } else {
-        remaining_ns_for_relative(request)
+        remaining_ns_for_relative(&request)
     };
     let remaining_ns = match remaining_ns {
         Ok(ns) => ns,

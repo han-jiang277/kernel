@@ -127,13 +127,35 @@ impl Serial {
                             drop(_lock);
                             'i: loop {
                                 let tx_seq = self.tx_futex.load(Ordering::Acquire);
+                                let loop_start = crate::time::now();
                                 // If the FIFO is full and we're in blocking mode, we need to
                                 // trigger the TX interrupt to start sending out the data in FIFO.
                                 self.trigger_tx_interrupt();
                                 if is_schedule_ready() {
-                                    match atomic_wait(&self.tx_futex, tx_seq, Tick::MAX) {
-                                        Ok(()) | Err(code::EAGAIN) => {}
-                                        Err(code::ETIMEDOUT) => return Err(ErrorKind::TimedOut),
+                                    // Use 500ms timeout to prevent infinite hang under heavy load
+                                    // (e.g., agent_loop stress test with WiFi contention).
+                                    // If TX ISR is delayed, fall back to polling for remaining bytes.
+                                    const TX_WAIT_TIMEOUT_MS: u64 = 500;
+                                    match atomic_wait(
+                                        &self.tx_futex,
+                                        tx_seq,
+                                        crate::time::Tick::from_millis(TX_WAIT_TIMEOUT_MS),
+                                    ) {
+                                        Ok(()) | Err(code::EAGAIN) => {
+                                            let elapsed = crate::time::now() - loop_start;
+                                            kearly_println!("[serial] atomic_wait woken seq={} elapsed={}ms", tx_seq, elapsed.as_millis());
+                                        }
+                                        Err(code::ETIMEDOUT) => {
+                                            // TX ISR didn't wake us in 500ms - TX interrupt path is stuck.
+                                            kearly_println!("[serial] atomic_wait TIMEOUT seq={} remaining={} bytes, fallback to polling", tx_seq, bytes.len() - nbytes);
+                                            // Fall back to polling for ALL remaining bytes to avoid
+                                            // repeated 500ms timeouts per byte (which would starve WiFi).
+                                            for &remaining_byte in &bytes[nbytes..] {
+                                                self.send_byte_polling(remaining_byte);
+                                                nbytes += 1;
+                                            }
+                                            break 'e;
+                                        }
                                         Err(_) => return Err(ErrorKind::Other),
                                     }
                                 } else {
@@ -334,6 +356,7 @@ impl Serial {
 
     #[inline(always)]
     fn flush_rx_fifo(&self) {
+        #[cfg(smp)]
         let _lock = self.critical_section_guard.irqsave_lock();
         self.rx_head.set(0);
         self.rx_end.set(0);
@@ -343,6 +366,7 @@ impl Serial {
 
     #[inline(always)]
     fn flush_tx_fifo(&self) {
+        #[cfg(smp)]
         let _lock = self.critical_section_guard.irqsave_lock();
         self.tx_head.set(0);
         self.tx_end.set(0);
@@ -377,6 +401,7 @@ impl Serial {
         // handler to run before we finish updating the TX buffer state. But it's not a problem as the interrupt
         // handler will check the buffer state and return immediately if there's no data to send.
         // So we can just accept this minor timing jitter for simplicity.
+        #[cfg(smp)]
         let _lock = self.critical_section_guard.irqsave_lock();
         self.dev.enable_interrupt(InterruptType::Tx);
         // FIXME: In the certain SoCs that TX is an edge interrupt. It only fires
@@ -412,6 +437,7 @@ impl Serial {
 
     #[inline(always)]
     fn get_char(&self) -> Option<u8> {
+        #[cfg(smp)]
         let _lock = self.critical_section_guard.irqsave_lock();
         if self.rx_head.get() != self.rx_end.get() {
             let c = self.rx_buffer.borrow()[self.rx_end.get() as usize];
