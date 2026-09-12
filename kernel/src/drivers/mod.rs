@@ -19,6 +19,7 @@ use crate::devices::bus::{Bus, BusInterface};
 #[cfg(max7219)]
 pub(crate) mod display;
 pub(crate) mod flash;
+
 pub(crate) mod ic;
 pub(crate) mod input;
 #[cfg(lcd)]
